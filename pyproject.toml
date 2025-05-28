@@ -35,8 +35,6 @@ insanely-fast-whisper = "insanely_fast_whisper.cli:main"
 Homepage = "https://github.com/Vaibhavs10/insanely-fast-whisper"
 Twitter = "https://twitter.com/reach_vb"
 
-[source]
-
 [[source]]
 name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu"
