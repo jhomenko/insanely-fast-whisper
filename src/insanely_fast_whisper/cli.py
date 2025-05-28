@@ -3,7 +3,6 @@ import argparse
 from transformers import pipeline
 from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
 import torch
-import intel_extension_for_pytorch as ipex
 
 from .utils.diarization_pipeline import diarize
 from .utils.result import build_result
@@ -139,10 +138,6 @@ def main():
         device="mps" if args.device_id == "mps" else (f"xpu:{args.device_id}" if torch.xpu.is_available() else f"cuda:{args.device_id}"),
         model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
     )
-
-    # Optimize the model with IPEX if using XPU
-    if "xpu" in pipe.device.type:
-        pipe.model = ipex.optimize(pipe.model, dtype=torch.float16)
 
     if args.device_id == "mps":
         torch.mps.empty_cache()
