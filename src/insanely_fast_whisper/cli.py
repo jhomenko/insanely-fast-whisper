@@ -187,6 +187,7 @@ def main():
             f"Voila!✨ Your file has been transcribed & speaker segmented go check it out over here 👉 {args.transcript_path}"
         )
     else:
+        print("Reached the non-diarization output section.")
         with open(args.transcript_path, "w", encoding="utf8") as fp:
             result = build_result([], outputs)
             json.dump(result, fp, ensure_ascii=False)
