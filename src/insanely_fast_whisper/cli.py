@@ -132,15 +132,9 @@ def main():
     torch_dtype = torch.float32 # Default dtype
 
     # Load the model first
-    pipe = pipeline(
+    pipe = pipeline (
         "automatic-speech-recognition",
         model=args.model_name,
-        device=device # Start with default device
-    ).model
-
-        "automatic-speech-recognition",
-        model=args.model_name,
-
     if torch.xpu.is_available() and args.device_id.isdigit() or (args.device_id == "xpu" and torch.xpu.is_available()):
         device = f"xpu:{args.device_id}"
         torch_dtype = torch.float16
