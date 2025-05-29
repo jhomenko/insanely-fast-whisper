@@ -55,7 +55,12 @@ input_audio = torch.tensor(audio) # Keep it on CPU initially
 
 # Prepare input features using the processor
 # Pass the CPU tensor to the processor
-input_features = processor(input_audio, sampling_rate=sample_rate, return_tensors="pt").input_features
+input_features = processor(
+    input_audio,
+    sampling_rate=sample_rate,
+    return_tensors="pt",
+    padding="longest",
+    return_attention_mask=True).input_features
 
 # Move the resulting input_features to the XPU device AND convert to float16
 input_features = input_features.to(device, dtype=torch.float32)
