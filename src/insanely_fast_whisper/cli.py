@@ -128,33 +128,43 @@ def main():
         if args.min_speakers > args.max_speakers:
             parser.error("--min-speakers cannot be greater than --max-speakers.")
 
+    device = "cpu" # Default device
+    torch_dtype = torch.float32 # Default dtype
+
     # Load the model first
     pipe = pipeline(
         "automatic-speech-recognition",
         model=args.model_name,
         model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
-        device="cpu"
+        device=device # Start with default device
     ).model
 
     # Determine the device
-    if torch.xpu.is_available() and args.device_id.isdigit():
-        device = f"xpu:{args.device_id}"
-        model.to(device)
-        model = model.half() # Cast to float16 for XPU
-        # Apply IPEX optimization for XPU
-        model = ipex.optimize(model, dtype=torch.float16)
-    elif args.device_id == "mps" and torch.mps.is_available():
-        device = "mps"
-        model.to(device)
-        torch.mps.empty_cache()
-
+    model = pipe.model # Get the underlying model from the pipeline
         "automatic-speech-recognition",
         model=args.model_name,
         torch_dtype=torch.float16,
         model=model, # Use the loaded and optimized model
         device=device, # Use the determined device
-    )
 
+
+    if torch.xpu.is_available() and args.device_id.isdigit():
+        device = f"xpu:{args.device_id}"
+        torch_dtype = torch.float16
+        model.to(device)
+        model = ipex.optimize(model, dtype=torch_dtype)
+    elif args.device_id == "mps" and torch.mps.is_available():
+        device = "mps"
+        model.to(device)
+        torch.mps.empty_cache()
+    elif args.device_id.isdigit() and torch.cuda.is_available():
+        device = f"cuda:{args.device_id}"
+        model.to(device)
+    else:
+        device = "cpu"
+        model.to(device)
+
+    # Update the pipeline with the potentially moved and optimized model and correct dtype
     # Set model to the pipeline's model after potentially moving and optimizing
     pipe.model = model
 
