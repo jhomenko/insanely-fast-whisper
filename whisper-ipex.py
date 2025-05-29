@@ -93,6 +93,7 @@ try:
         return_segments=True,  
         num_segment_frames=16000 * 30, 
         return_timestamps=True)
+    print("Result from model.generate():", result) # Add this line
 
     # 4. Process the output
 # The structure of the 'result' is a dictionary with a 'segments' key
