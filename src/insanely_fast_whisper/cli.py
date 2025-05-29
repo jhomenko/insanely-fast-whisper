@@ -132,10 +132,9 @@ def main():
     torch_dtype = torch.float32 # Default dtype
 
     # Load the model first
-    pipe = pipeline(
+    pipe = pipeline (
         "automatic-speech-recognition",
         model=args.model_name,
-        model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
         device=device # Start with default device
     ).model
 
@@ -143,12 +142,8 @@ def main():
     model = pipe.model # Get the underlying model from the pipeline
         "automatic-speech-recognition",
         model=args.model_name,
-        torch_dtype=torch.float16,
-        model=model, # Use the loaded and optimized model
-        device=device, # Use the determined device
 
-
-    if torch.xpu.is_available() and args.device_id.isdigit():
+    if torch.xpu.is_available() and args.device_id.isdigit() or (args.device_id == "xpu" and torch.xpu.is_available()):
         device = f"xpu:{args.device_id}"
         torch_dtype = torch.float16
         model.to(device)
@@ -167,13 +162,8 @@ def main():
     # Update the pipeline with the potentially moved and optimized model and correct dtype
     # Set model to the pipeline's model after potentially moving and optimizing
     pipe.model = model
+    pipe.model.config.torch_dtype = torch_dtype
 
-    elif args.device_id.isdigit() and torch.cuda.is_available():
-        device = f"cuda:{args.device_id}"
-        model.to(device)
-    else:
-        device = "cpu"
-        model.to(device)
     ts = "word" if args.timestamp == "word" else True
 
     language = None if args.language == "None" else args.language
@@ -195,8 +185,6 @@ def main():
             chunk_length_s=30,
             batch_size=args.batch_size,
             generate_kwargs=generate_kwargs,
-            # Ensure processor call includes padding and attention mask
-            padding="longest",
             return_attention_mask=True,
             return_timestamps=ts,
         )
