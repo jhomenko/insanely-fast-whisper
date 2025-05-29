@@ -14,6 +14,9 @@ dependencies = [
     "rich>=13.7.0",
     "torch==2.7.0",
     "torchaudio==2.7.0",
+    "intel-extension-for-pytorch==2.7.10+xpu",
+    "oneccl_bind_pt==2.7.0+xpu",
+    "
 ]
 requires-python = ">=3.9"
 readme = "README.md"
