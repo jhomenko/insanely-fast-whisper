@@ -132,14 +132,12 @@ def main():
     torch_dtype = torch.float32 # Default dtype
 
     # Load the model first
-    pipe = pipeline (
+    pipe = pipeline(
         "automatic-speech-recognition",
         model=args.model_name,
         device=device # Start with default device
     ).model
 
-    # Determine the device
-    model = pipe.model # Get the underlying model from the pipeline
         "automatic-speech-recognition",
         model=args.model_name,
 
@@ -147,14 +145,13 @@ def main():
         device = f"xpu:{args.device_id}"
         torch_dtype = torch.float16
         model.to(device)
-        model = ipex.optimize(model, dtype=torch_dtype)
+        pipe = ipex.optimize(pipe, dtype=torch_dtype) # Apply optimization to the pipeline
     elif args.device_id == "mps" and torch.mps.is_available():
         device = "mps"
-        model.to(device)
+        pipe.to(device)
         torch.mps.empty_cache()
     elif args.device_id.isdigit() and torch.cuda.is_available():
         device = f"cuda:{args.device_id}"
-        model.to(device)
     else:
         device = "cpu"
         model.to(device)
@@ -162,7 +159,7 @@ def main():
     # Update the pipeline with the potentially moved and optimized model and correct dtype
     # Set model to the pipeline's model after potentially moving and optimizing
     pipe.model = model
-    pipe.model.config.torch_dtype = torch_dtype
+    pipe.model.config.torch_dtype = torch_dtype # This line might not be strictly necessary but doesn't hurt
 
     ts = "word" if args.timestamp == "word" else True
 
@@ -187,6 +184,7 @@ def main():
             generate_kwargs=generate_kwargs,
             return_attention_mask=True,
             return_timestamps=ts,
+        padding="longest"
         )
 
     if args.hf_token != "no_token":
