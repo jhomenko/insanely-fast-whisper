@@ -127,12 +127,11 @@ def main():
     if args.min_speakers is not None and args.max_speakers is not None and args.min_speakers > args.max_speakers:
         if args.min_speakers > args.max_speakers:
             parser.error("--min-speakers cannot be greater than --max-speakers.")
-    
+
     # Load the model first
-    model = pipeline(
+    pipe = pipeline(
         "automatic-speech-recognition",
         model=args.model_name,
-        torch_dtype=torch.float16,
         model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
         device="cpu"
     ).model
@@ -141,20 +140,14 @@ def main():
     if torch.xpu.is_available() and args.device_id.isdigit():
         device = f"xpu:{args.device_id}"
         model.to(device)
+        model = model.half() # Cast to float16 for XPU
         # Apply IPEX optimization for XPU
         model = ipex.optimize(model, dtype=torch.float16)
     elif args.device_id == "mps" and torch.mps.is_available():
         device = "mps"
         model.to(device)
         torch.mps.empty_cache()
-    elif args.device_id.isdigit() and torch.cuda.is_available():
-        device = f"cuda:{args.device_id}"
-        model.to(device)
-    else:
-        device = "cpu"
-        model.to(device)
 
-    pipe = pipeline(
         "automatic-speech-recognition",
         model=args.model_name,
         torch_dtype=torch.float16,
@@ -162,6 +155,15 @@ def main():
         device=device, # Use the determined device
     )
 
+    # Set model to the pipeline's model after potentially moving and optimizing
+    pipe.model = model
+
+    elif args.device_id.isdigit() and torch.cuda.is_available():
+        device = f"cuda:{args.device_id}"
+        model.to(device)
+    else:
+        device = "cpu"
+        model.to(device)
     ts = "word" if args.timestamp == "word" else True
 
     language = None if args.language == "None" else args.language
