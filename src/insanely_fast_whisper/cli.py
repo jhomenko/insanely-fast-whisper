@@ -127,7 +127,6 @@ def main():
     if args.min_speakers is not None and args.max_speakers is not None and args.min_speakers > args.max_speakers:
         if args.min_speakers > args.max_speakers:
             parser.error("--min-speakers cannot be greater than --max-speakers.")
-
     device = "cpu" # Default device
     torch_dtype = torch.float32 # Default dtype
 
@@ -136,16 +135,16 @@ def main():
         "automatic-speech-recognition",
         model=args.model_name,
     if torch.xpu.is_available() and args.device_id.isdigit() or (args.device_id == "xpu" and torch.xpu.is_available()):
-        device = f"xpu:{args.device_id}"
+ device = f"xpu:{args.device_id}"
         torch_dtype = torch.float16
         model.to(device)
-        pipe = ipex.optimize(pipe, dtype=torch_dtype) # Apply optimization to the pipeline
+ pipe = ipex.optimize(pipe, dtype=torch_dtype) # Apply optimization to the pipeline
     elif args.device_id == "mps" and torch.mps.is_available():
-        device = "mps"
+ device = "mps"
         pipe.to(device)
         torch.mps.empty_cache()
     elif args.device_id.isdigit() and torch.cuda.is_available():
-        device = f"cuda:{args.device_id}"
+ device = f"cuda:{args.device_id}"
     else:
         device = "cpu"
         model.to(device)
