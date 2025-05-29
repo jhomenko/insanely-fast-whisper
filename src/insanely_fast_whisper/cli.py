@@ -127,6 +127,7 @@ def main():
     if args.min_speakers is not None and args.max_speakers is not None and args.min_speakers > args.max_speakers:
         if args.min_speakers > args.max_speakers:
             parser.error("--min-speakers cannot be greater than --max-speakers.")
+
     device = "cpu" # Default device
 
     # Load the model first
@@ -141,12 +142,7 @@ def main():
         device = f"xpu:{args.device_id}" if args.device_id.isdigit() else "xpu:0"
         torch_dtype = torch.float16
         pipe.model.to(device).to(torch_dtype)
-        pipe.model = ipex.optimize(pipe.model, dtype=torch_dtype) # Apply optimization to the model
-    elif args.device_id == "mps" and torch.mps.is_available():
-        device = "mps"
-        pipe.to(device)
-        torch.mps.empty_cache()
-    elif args.device_id.isdigit() and torch.cuda.is_available():
+        pipe.model = ipex.optimize(pipe.model, dtype=torch_dtype) # Apply optimization to the modelelif args.device_id == "mps" and torch.mps.is_available():        device = "mps"        pipe.to(device)        torch.mps.empty_cache()    elif args.device_id.isdigit() and torch.cuda.is_available():
         device = f"cuda:{args.device_id}"
         pipe.to(device)
     # Update the pipeline with the potentially moved and optimized model and correct dtype
@@ -178,6 +174,7 @@ def main():
             return_attention_mask=True,
             return_timestamps=ts,
         padding="longest"
+        )
         )
 
     if args.hf_token != "no_token":
