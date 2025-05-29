@@ -4,6 +4,7 @@ from transformers import pipeline
 from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
 import torch
 
+import intel_extension_for_pytorch as ipex
 from .utils.diarization_pipeline import diarize
 from .utils.result import build_result
 
@@ -126,23 +127,40 @@ def main():
     if args.min_speakers is not None and args.max_speakers is not None and args.min_speakers > args.max_speakers:
         if args.min_speakers > args.max_speakers:
             parser.error("--min-speakers cannot be greater than --max-speakers.")
-
+    
     # Load the model first
     model = pipeline(
-        "automatic-speech-recognition", model=args.model_name, torch_dtype=torch.float16, model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"}, device="cpu"
+        "automatic-speech-recognition",
+        model=args.model_name,
+        torch_dtype=torch.float16,
+        model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
+        device="cpu"
     ).model
+
+    # Determine the device
+    if torch.xpu.is_available() and args.device_id.isdigit():
+        device = f"xpu:{args.device_id}"
+        model.to(device)
+        # Apply IPEX optimization for XPU
+        model = ipex.optimize(model, dtype=torch.float16)
+    elif args.device_id == "mps" and torch.mps.is_available():
+        device = "mps"
+        model.to(device)
+        torch.mps.empty_cache()
+    elif args.device_id.isdigit() and torch.cuda.is_available():
+        device = f"cuda:{args.device_id}"
+        model.to(device)
+    else:
+        device = "cpu"
+        model.to(device)
+
     pipe = pipeline(
         "automatic-speech-recognition",
         model=args.model_name,
         torch_dtype=torch.float16,
-        device="mps" if args.device_id == "mps" else (f"xpu:{args.device_id}" if torch.xpu.is_available() else f"cuda:{args.device_id}"),
-        model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
+        model=model, # Use the loaded and optimized model
+        device=device, # Use the determined device
     )
-
-    if args.device_id == "mps":
-        torch.mps.empty_cache()
-    # elif not args.flash:
-        # pipe.model = pipe.model.to_bettertransformer()
 
     ts = "word" if args.timestamp == "word" else True
 
@@ -165,6 +183,9 @@ def main():
             chunk_length_s=30,
             batch_size=args.batch_size,
             generate_kwargs=generate_kwargs,
+            # Ensure processor call includes padding and attention mask
+            padding="longest",
+            return_attention_mask=True,
             return_timestamps=ts,
         )
 
