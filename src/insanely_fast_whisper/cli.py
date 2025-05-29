@@ -173,9 +173,9 @@ def main():
             generate_kwargs=generate_kwargs,
             return_attention_mask=True,
             return_timestamps=ts,
-        padding="longest"
+            padding="longest"
         )
-        )
+        
 
     if args.hf_token != "no_token":
         speakers_transcript = diarize(args, outputs)
