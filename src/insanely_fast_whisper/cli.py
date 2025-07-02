@@ -16,7 +16,7 @@ parser.add_argument(
     "--file-name",
     required=True,
     type=str,
-    help="Path or URL to the audio file to be transcribed.",
+    help="Path or URL to the audio file to be transcribed. If a relative path is provided, it will be looked for in the 'input' folder.",
 )
 parser.add_argument(
     "--device-id",
@@ -28,9 +28,9 @@ parser.add_argument(
 parser.add_argument(
     "--transcript-path",
     required=False,
-    default="output.json",
+    default="output/output.json",
     type=str,
-    help="Path to save the transcription output. (default: output.json)",
+    help="Path to save the transcription output. (default: output/output.json)",
 )
 parser.add_argument(
     "--model-name",
@@ -183,9 +183,13 @@ def main():
         )
 
         import librosa
+        import os
+        # Check if file_name is a relative path and prepend 'input' folder if so
+        if not os.path.isabs(args.file_name) and not args.file_name.startswith('http'):
+            args.file_name = os.path.join('input', args.file_name)
         audio, sr = librosa.load(args.file_name, sr=16000)
         audio_duration = len(audio) / sr
-        print(f"Audio loaded, length: {audio_duration:.2f} seconds")
+        print(f"Audio loaded from {args.file_name}, length: {audio_duration:.2f} seconds")
 
         # Process audio input for long-form transcription
         start_time = time.time()
@@ -285,7 +289,7 @@ def main():
             json.dump(result, fp, ensure_ascii=False)
 
         print(
-            f"Voila!✨ Your file has been transcribed & speaker segmented go check it out over here 👉 {args.transcript_path}"
+            f"Voila!✨ Your file has been transcribed & speaker segmented, go check it out over here 👉 {args.transcript_path}"
         )
     else:
         with open(args.transcript_path, "w", encoding="utf8") as fp:
@@ -293,5 +297,5 @@ def main():
             json.dump(result, fp, ensure_ascii=False)
 
         print(
-            f"Voila!✨ Your file has been transcribed go check it out over here 👉 {args.transcript_path}"
+            f"Voila!✨ Your file has been transcribed, go check it out over here 👉 {args.transcript_path}"
         )
