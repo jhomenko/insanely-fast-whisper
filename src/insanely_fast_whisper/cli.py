@@ -136,7 +136,8 @@ def main():
     model = TransformersAutoModel.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
-        use_cache=True
+        use_cache=True,
+        use_auth_token=args.hf_token if args.hf_token != "no_token" else None
     )
     
     # Set model to eval mode before optimization
@@ -176,58 +177,106 @@ def main():
         progress.add_task("[yellow]Transcribing...", total=None)
 
         from transformers import WhisperProcessor
-        processor = WhisperProcessor.from_pretrained(args.model_name)
+        processor = WhisperProcessor.from_pretrained(
+            args.model_name,
+            use_auth_token=args.hf_token if args.hf_token != "no_token" else None
+        )
 
         import librosa
         audio, sr = librosa.load(args.file_name, sr=16000)
-        input_features = processor(audio, sampling_rate=sr, return_tensors="pt").input_features.to(device, dtype=torch.float16)
-        print(f"Input features moved to device: {device} with dtype: {input_features.dtype}")
-
-        # Use manual chunking with direct generate method for long-form transcription
-        start_time = time.time()
-        print("Starting transcription process...")
-        audio, sr = librosa.load(args.file_name, sr=16000)
         audio_duration = len(audio) / sr
         print(f"Audio loaded, length: {audio_duration:.2f} seconds")
-        
-        # Define chunk length (30 seconds is the max receptive field for Whisper)
-        chunk_length_s = 30
-        chunk_samples = chunk_length_s * sr
-        num_chunks = int(np.ceil(audio_duration / chunk_length_s))
-        print(f"Processing audio in {num_chunks} chunks of {chunk_length_s} seconds each")
-        
-        segments = []
-        for i in range(num_chunks):
-            start_sample = i * chunk_samples
-            end_sample = min((i + 1) * chunk_samples, len(audio))
-            chunk_audio = audio[start_sample:end_sample]
-            chunk_duration = (end_sample - start_sample) / sr
-            
-            print(f"Processing chunk {i+1}/{num_chunks} ({chunk_duration:.2f} seconds)")
-            chunk_start_time = time.time()
-            
-            # Extract features for the chunk
-            input_features = processor(chunk_audio, sampling_rate=sr, return_tensors="pt").input_features.to(device, dtype=torch.float16)
-            
-            # Generate transcription for the chunk
-            with torch.no_grad():
+
+        # Process audio input for long-form transcription
+        start_time = time.time()
+        print("Starting transcription process...")
+        model.generation_config.max_new_tokens = 256
+        inputs = processor(
+            audio,
+            sampling_rate=sr,
+            return_tensors="pt",
+            truncation=False,
+            padding="longest",
+            return_attention_mask=True
+        )
+        input_features = inputs.input_features.to(device, dtype=torch.float16)
+        attention_mask = inputs.attention_mask.to(device) if hasattr(inputs, 'attention_mask') else None
+        print(f"Input features moved to device: {device} with dtype: {input_features.dtype}")
+
+        # Update generate_kwargs with long-form transcription parameters
+        generate_kwargs.update({
+            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            "logprob_threshold": -1.0,
+            "compression_ratio_threshold": 1.35,
+            "return_timestamps": True if args.timestamp == "chunk" else "word",
+            "max_new_tokens": 256,
+            "num_beams": 1,
+            "condition_on_prev_tokens": False,
+            "no_speech_threshold": 0.6
+        })
+
+        # Generate transcription using the model's generate method directly
+        with torch.no_grad():
+            if attention_mask is not None:
+                predicted_ids = model.generate(input_features, attention_mask=attention_mask, **generate_kwargs)
+            else:
                 predicted_ids = model.generate(input_features, **generate_kwargs)
-            
-            # Decode the transcription
-            chunk_text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-            
-            # Adjust timestamps to match the overall audio timeline
-            chunk_start_time_audio = start_sample / sr
-            segments.append({
-                'start': chunk_start_time_audio,
-                'end': chunk_start_time_audio + chunk_duration,
-                'text': chunk_text
-            })
-            
-            print(f"Chunk {i+1}/{num_chunks} processed in {time.time() - chunk_start_time:.2f} seconds")
+        print(f"Transcription completed in {time.time() - start_time:.2f} seconds")
+
+        # Decode the transcription with timestamp information
+        result = processor.batch_decode(predicted_ids, skip_special_tokens=False)
+        clean_result = processor.batch_decode(predicted_ids, skip_special_tokens=True)
         
-        outputs = {'segments': segments}
-        print(f"Transcription completed in {time.time() - start_time:.2f} seconds for all {num_chunks} chunks")
+        # Process transcription output to build chunks using timestamps
+        chunks = []
+        if isinstance(result, list) and len(result) == 1:
+            # Single audio input, attempt to parse timestamps from the raw output
+            raw_output = result[0]
+            import re
+            
+            # Look for timestamp patterns in the raw output (e.g., <|0.00|>, <|1.23|>)
+            timestamp_pattern = r"<\|(\d+\.\d+)\|>"
+            timestamps = re.findall(timestamp_pattern, raw_output)
+            text_parts = re.split(timestamp_pattern, raw_output)
+            
+            if len(timestamps) > 0:
+                # We have timestamps, build chunks accordingly
+                used_texts = set()  # To avoid repetitions
+                for i in range(len(timestamps)):
+                    start_time = float(timestamps[i])
+                    # Get the text between this timestamp and the next (or end)
+                    text_segment = text_parts[i + 1].strip()
+                    # Clean up any remaining special tokens or artifacts
+                    text_segment = re.sub(r"<\|[^>]*\|>", "", text_segment).strip()
+                    if text_segment and text_segment not in used_texts:
+                        used_texts.add(text_segment)
+                        end_time = float(timestamps[i + 1]) if i + 1 < len(timestamps) else audio_duration
+                        chunks.append({
+                            'start': start_time,
+                            'end': end_time,
+                            'text': text_segment
+                        })
+            else:
+                # No timestamps found, use the clean transcription as a single chunk
+                clean_text = clean_result[0] if isinstance(clean_result, list) else clean_result
+                chunks.append({
+                    'start': 0.0,
+                    'end': audio_duration,
+                    'text': clean_text
+                })
+        else:
+            # Fallback if output format is unexpected
+            clean_text = clean_result[0] if isinstance(clean_result, list) else clean_result
+            chunks.append({
+                'start': 0.0,
+                'end': audio_duration,
+                'text': clean_text
+            })
+        
+        # Build the text field by concatenating chunk texts
+        text = " ".join(chunk['text'] for chunk in chunks)
+        outputs = {'chunks': chunks, 'segments': chunks, 'text': text}
+        print(f"Transcription completed with {len(chunks)} chunks")
 
     if args.hf_token != "no_token":
         speakers_transcript = diarize(args, outputs)
