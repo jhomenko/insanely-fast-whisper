@@ -1,10 +1,10 @@
 import json
 import argparse
 import time
+import torch
 from transformers import WhisperProcessor
 from transformers import AutoModelForSpeechSeq2Seq
 from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
-import torch
 import librosa
 import numpy as np
 
@@ -59,7 +59,7 @@ parser.add_argument(
     required=False,
     type=int,
     default=12,
-    help="Number of parallel batches you want to compute. Reduce if you face OOMs. (default: 12)",
+    help="Number of parallel batches for chunk processing. Reduce if you face OOMs. (default: 12)",
 )
 parser.add_argument(
     "--flash",
@@ -67,6 +67,48 @@ parser.add_argument(
     type=bool,
     default=False,
     help="Use Flash Attention 2. Read the FAQs to see how to install FA2 correctly. (default: False)",
+)
+parser.add_argument(
+    "--vad-filter",
+    required=False,
+    type=bool,
+    default=False,
+    help="Enable Voice Activity Detection to filter out silent parts before transcription. (default: False)",
+)
+parser.add_argument(
+    "--vad-threshold",
+    required=False,
+    type=float,
+    default=0.5,
+    help="Threshold for Voice Activity Detection (between 0 and 1). Higher values are stricter. (default: 0.5)",
+)
+parser.add_argument(
+    "--vad-min-speech-duration-ms",
+    required=False,
+    type=int,
+    default=250,
+    help="Minimum speech duration in milliseconds for VAD. (default: 250)",
+)
+parser.add_argument(
+    "--vad-max-speech-duration-s",
+    required=False,
+    type=float,
+    default=15.0,
+    help="Maximum speech duration in seconds for VAD. (default: 15.0)",
+)
+parser.add_argument(
+    "--vad-min-silence-duration-ms",
+    required=False,
+    type=int,
+    default=200,
+    help="Minimum silence duration in milliseconds between speech segments for VAD. (default: 200)",
+)
+parser.add_argument(
+    "--vad-speech-pad-ms",
+    required=False,
+    type=int,
+    default=30,
+    help="Padding added to speech segments in milliseconds for VAD. (default: 30)",
 )
 parser.add_argument(
     "--timestamp",
@@ -184,6 +226,7 @@ def main():
 
         import librosa
         import os
+        import numpy as np
         # Check if file_name is a relative path and prepend 'input' folder if so
         if not os.path.isabs(args.file_name) and not args.file_name.startswith('http'):
             args.file_name = os.path.join('input', args.file_name)
@@ -191,21 +234,40 @@ def main():
         audio_duration = len(audio) / sr
         print(f"Audio loaded from {args.file_name}, length: {audio_duration:.2f} seconds")
 
+        # Voice Activity Detection (VAD) pre-processing if enabled
+        speech_chunks = []
+        if args.vad_filter:
+            print("Applying Voice Activity Detection to filter silent parts...")
+            try:
+                vad_model, vad_utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=False, trust_repo=True)
+                get_speech_timestamps, _, _, _, _ = vad_utils
+                audio_tensor = torch.from_numpy(audio).float()
+                speech_timestamps = get_speech_timestamps(
+                    audio_tensor,
+                    vad_model,
+                    sampling_rate=sr,
+                    threshold=args.vad_threshold,
+                    min_speech_duration_ms=args.vad_min_speech_duration_ms,
+                    max_speech_duration_s=args.vad_max_speech_duration_s,
+                    min_silence_duration_ms=args.vad_min_silence_duration_ms,
+                    speech_pad_ms=args.vad_speech_pad_ms
+                )
+                speech_chunks = [(ts['start'] / sr, ts['end'] / sr) for ts in speech_timestamps]
+                if not speech_chunks:
+                    print("No speech detected after VAD. Proceeding with full audio.")
+                    speech_chunks = [(0.0, audio_duration)]
+                else:
+                    print(f"Detected {len(speech_chunks)} speech segments after VAD.")
+            except Exception as e:
+                print(f"Failed to apply VAD: {str(e)}. Proceeding with full audio.")
+                speech_chunks = [(0.0, audio_duration)]
+        else:
+            speech_chunks = [(0.0, audio_duration)]
+
         # Process audio input for long-form transcription
         start_time = time.time()
         print("Starting transcription process...")
         model.generation_config.max_new_tokens = 256
-        inputs = processor(
-            audio,
-            sampling_rate=sr,
-            return_tensors="pt",
-            truncation=False,
-            padding="longest",
-            return_attention_mask=True
-        )
-        input_features = inputs.input_features.to(device, dtype=torch.float16)
-        attention_mask = inputs.attention_mask.to(device) if hasattr(inputs, 'attention_mask') else None
-        print(f"Input features moved to device: {device} with dtype: {input_features.dtype}")
 
         # Update generate_kwargs with long-form transcription parameters
         generate_kwargs.update({
@@ -219,68 +281,96 @@ def main():
             "no_speech_threshold": 0.6
         })
 
-        # Generate transcription using the model's generate method directly
-        with torch.no_grad():
-            if attention_mask is not None:
-                predicted_ids = model.generate(input_features, attention_mask=attention_mask, **generate_kwargs)
-            else:
-                predicted_ids = model.generate(input_features, **generate_kwargs)
-        print(f"Transcription completed in {time.time() - start_time:.2f} seconds")
+        # Define chunk length (30 seconds is the max receptive field for Whisper)
+        chunk_length_s = 30
+        chunk_samples = chunk_length_s * sr
+        num_chunks = int(np.ceil(audio_duration / chunk_length_s))
+        print(f"Processing audio in {num_chunks} chunks of {chunk_length_s} seconds each")
 
-        # Decode the transcription with timestamp information
-        result = processor.batch_decode(predicted_ids, skip_special_tokens=False)
-        clean_result = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-        
-        # Process transcription output to build chunks using timestamps
-        chunks = []
-        if isinstance(result, list) and len(result) == 1:
-            # Single audio input, attempt to parse timestamps from the raw output
-            raw_output = result[0]
-            import re
+        segments = []
+        for i in range(0, num_chunks, args.batch_size):
+            batch_start = i
+            batch_end = min(i + args.batch_size, num_chunks)
+            batch_input_features = []
+            batch_attention_masks = []
+            for j in range(batch_start, batch_end):
+                start_sample = j * chunk_samples
+                end_sample = min((j + 1) * chunk_samples, len(audio))
+                chunk_audio = audio[start_sample:end_sample]
+                chunk_duration = (end_sample - start_sample) / sr
+                
+                print(f"Preparing chunk {j+1}/{num_chunks} ({chunk_duration:.2f} seconds)")
+                
+                # Extract features for the chunk
+                inputs = processor(chunk_audio, sampling_rate=sr, return_tensors="pt", truncation=False, padding="longest", return_attention_mask=True)
+                batch_input_features.append(inputs.input_features)
+                if hasattr(inputs, 'attention_mask'):
+                    batch_attention_masks.append(inputs.attention_mask)
+                else:
+                    batch_attention_masks.append(None)
             
-            # Look for timestamp patterns in the raw output (e.g., <|0.00|>, <|1.23|>)
-            timestamp_pattern = r"<\|(\d+\.\d+)\|>"
-            timestamps = re.findall(timestamp_pattern, raw_output)
-            text_parts = re.split(timestamp_pattern, raw_output)
-            
-            if len(timestamps) > 0:
-                # We have timestamps, build chunks accordingly
-                used_texts = set()  # To avoid repetitions
-                for i in range(len(timestamps)):
-                    start_time = float(timestamps[i])
-                    # Get the text between this timestamp and the next (or end)
-                    text_segment = text_parts[i + 1].strip()
-                    # Clean up any remaining special tokens or artifacts
-                    text_segment = re.sub(r"<\|[^>]*\|>", "", text_segment).strip()
-                    if text_segment and text_segment not in used_texts:
-                        used_texts.add(text_segment)
-                        end_time = float(timestamps[i + 1]) if i + 1 < len(timestamps) else audio_duration
-                        chunks.append({
-                            'start': start_time,
-                            'end': end_time,
-                            'text': text_segment
-                        })
+            # Stack batch inputs with padding if necessary
+            if len(batch_input_features) > 1:
+                # Find the maximum size for padding
+                max_size = max(f.shape[-1] for f in batch_input_features)
+                padded_features = []
+                for f in batch_input_features:
+                    if f.shape[-1] < max_size:
+                        pad_size = max_size - f.shape[-1]
+                        f_padded = torch.nn.functional.pad(f, (0, pad_size), mode='constant', value=0)
+                        padded_features.append(f_padded)
+                    else:
+                        padded_features.append(f)
+                batch_input_features = torch.cat(padded_features, dim=0).to(device, dtype=torch.float16)
             else:
-                # No timestamps found, use the clean transcription as a single chunk
-                clean_text = clean_result[0] if isinstance(clean_result, list) else clean_result
-                chunks.append({
-                    'start': 0.0,
-                    'end': audio_duration,
-                    'text': clean_text
+                batch_input_features = batch_input_features[0].to(device, dtype=torch.float16)
+
+            if any(mask is not None for mask in batch_attention_masks):
+                if len(batch_attention_masks) > 1:
+                    # Pad attention masks if necessary
+                    max_size = max(m.shape[-1] for m in batch_attention_masks if m is not None)
+                    padded_masks = []
+                    for m in batch_attention_masks:
+                        if m is not None and m.shape[-1] < max_size:
+                            pad_size = max_size - m.shape[-1]
+                            m_padded = torch.nn.functional.pad(m, (0, pad_size), mode='constant', value=0)
+                            padded_masks.append(m_padded)
+                        elif m is not None:
+                            padded_masks.append(m)
+                    batch_attention_masks = torch.cat(padded_masks, dim=0).to(device)
+                else:
+                    batch_attention_masks = batch_attention_masks[0].to(device) if batch_attention_masks[0] is not None else None
+            else:
+                batch_attention_masks = None
+            
+            print(f"Processing batch of chunks {batch_start+1} to {batch_end}/{num_chunks}")
+            batch_start_time = time.time()
+            
+            # Generate transcription for the batch
+            with torch.no_grad():
+                if batch_attention_masks is not None:
+                    batch_predicted_ids = model.generate(batch_input_features, attention_mask=batch_attention_masks, **generate_kwargs)
+                else:
+                    batch_predicted_ids = model.generate(batch_input_features, **generate_kwargs)
+            
+            print(f"Batch processed in {time.time() - batch_start_time:.2f} seconds")
+            
+            # Decode the transcriptions for each chunk in the batch
+            batch_texts = processor.batch_decode(batch_predicted_ids, skip_special_tokens=True)
+            for j, chunk_text in enumerate(batch_texts):
+                chunk_idx = batch_start + j
+                chunk_start_time_audio = (chunk_idx * chunk_samples) / sr
+                chunk_end_time_audio = min(((chunk_idx + 1) * chunk_samples) / sr, audio_duration)
+                segments.append({
+                    'start': chunk_start_time_audio,
+                    'end': chunk_end_time_audio,
+                    'text': chunk_text
                 })
-        else:
-            # Fallback if output format is unexpected
-            clean_text = clean_result[0] if isinstance(clean_result, list) else clean_result
-            chunks.append({
-                'start': 0.0,
-                'end': audio_duration,
-                'text': clean_text
-            })
+                print(f"Chunk {chunk_idx+1}/{num_chunks} transcribed: {chunk_text[:50]}...")
         
-        # Build the text field by concatenating chunk texts
-        text = " ".join(chunk['text'] for chunk in chunks)
-        outputs = {'chunks': chunks, 'segments': chunks, 'text': text}
-        print(f"Transcription completed with {len(chunks)} chunks")
+        # Prepare outputs for diarization or final result
+        outputs = {'segments': segments}
+        print(f"Transcription completed in {time.time() - start_time:.2f} seconds for all {num_chunks} chunks")
 
     if args.hf_token != "no_token":
         speakers_transcript = diarize(args, outputs)
