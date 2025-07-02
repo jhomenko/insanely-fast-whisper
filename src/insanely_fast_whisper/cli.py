@@ -35,9 +35,9 @@ parser.add_argument(
 parser.add_argument(
     "--model-name",
     required=False,
-    default="openai/whisper-large-v3",
+    default="distil-whisper/distil-medium.en",
     type=str,
-    help="Name of the pretrained model/ checkpoint to perform ASR. (default: openai/whisper-large-v3)",
+    help="Name of the pretrained model/ checkpoint to perform ASR. (default: distil-whisper/distil-medium.en)",
 )
 parser.add_argument(
     "--task",

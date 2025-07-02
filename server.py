@@ -2,123 +2,173 @@ import os
 import argparse
 import tempfile
 import shutil
+import json
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
-import torch
-import librosa
-import numpy as np
-from transformers import AutoModelForSpeechSeq2Seq, WhisperProcessor
-import intel_extension_for_pytorch as ipex
 from dotenv import load_dotenv
+import sys
+import io
+from contextlib import redirect_stdout, redirect_stderr
+
+# Import the CLI module directly to reuse its functionality
+from insanely_fast_whisper.cli import main as cli_main, parser as cli_parser
 
 # Load environment variables for configuration
 load_dotenv()
 
 app = FastAPI(title="Insanely Fast Whisper API", description="API for audio transcription using optimized Whisper model")
 
-# Global variables to store model and processor
-model = None
-processor = None
-device = None
+# Global variable to store command-line arguments
+args = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Load the optimized Whisper model on startup."""
-    global model, processor, device
+    """Initialize server settings on startup."""
+    global args
     
-    # Parse command line arguments for device override
+    # Parse command line arguments for server and CLI settings
     parser = argparse.ArgumentParser(description="FastAPI server for Whisper transcription")
     parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to run the server on")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 8000)), help="Port to run the server on")
-    parser.add_argument("--xpu", action="store_true", help="Force use of XPU device")
+    
+    # Add all arguments from cli.py parser to ensure compatibility
+    for action in cli_parser._actions:
+        if action.dest not in ['help', 'file_name', 'transcript_path']:  # Exclude file-specific args to be set per request
+            parser.add_argument(
+                action.option_strings[0] if action.option_strings else action.dest,
+                dest=action.dest,
+                type=action.type,
+                default=action.default if action.default is not None else os.getenv(action.dest.upper(), action.default),
+                help=action.help,
+                choices=action.choices
+            )
+    
     args, _ = parser.parse_known_args()
-    
-    # Determine device
-    if args.xpu:
-        device = "xpu"
-    else:
-        device = "cuda" if torch.cuda.is_available() else "xpu" if torch.xpu.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
-    # Load model
-    model_name = os.getenv("MODEL_NAME", "openai/whisper-large-v3")
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        use_cache=True
-    )
-    model.eval()
-    model = ipex.llm.optimize(model, dtype=torch.float16, device=device)
-    model.to(device)
-    print(f"Model loaded and optimized on {device}")
-    
-    # Load processor
-    processor = WhisperProcessor.from_pretrained(model_name)
-    print("Processor loaded")
+    print(f"Server initialized with host: {args.host}, port: {args.port}")
 
 @app.post("/transcribe/")
 async def transcribe_audio(file: UploadFile = File(...)):
-    """Endpoint to transcribe audio files."""
-    if not model or not processor:
-        raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again later.")
-    
+    """Endpoint to transcribe audio files using the CLI module directly."""
     # Validate file extension
     allowed_extensions = {".wav", ".mp3", ".m4a"}
     file_extension = os.path.splitext(file.filename)[1].lower()
     if file_extension not in allowed_extensions:
         raise HTTPException(status_code=400, detail=f"Unsupported file format. Only {', '.join(allowed_extensions)} are allowed.")
     
-    # Validate file size (limit to 20 MB)
-    file_size = file.size
-    if file_size > 20 * 1024 * 1024:  # 20 MB in bytes
-        raise HTTPException(status_code=400, detail="File size exceeds 20 MB limit.")
-    
     # Save file to temporary directory
     temp_dir = "/tmp/audio"
     os.makedirs(temp_dir, exist_ok=True)
     temp_file_path = os.path.join(temp_dir, file.filename)
+    temp_output_path = os.path.join(temp_dir, f"output_{file.filename}.json")
     
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Load and process audio
-        audio, sr = librosa.load(temp_file_path, sr=16000, mono=True)
-        audio_duration = len(audio) / sr
+        # Prepare command-line arguments for CLI main function by overriding sys.argv
+        original_argv = sys.argv
+        sys.argv = [
+            "cli.py",  # Script name placeholder
+            "--file-name", temp_file_path,
+            "--transcript-path", temp_output_path
+        ]
         
-        # Validate audio duration (limit to 1 minute)
-        if audio_duration > 60:
-            raise HTTPException(status_code=400, detail="Audio duration exceeds 1 minute limit.")
+        # Add other arguments from the server configuration
+        if hasattr(args, 'device_id') and args.device_id:
+            sys.argv.extend(["--device-id", str(args.device_id)])
+        if hasattr(args, 'model_name') and args.model_name:
+            sys.argv.extend(["--model-name", args.model_name])
+        if hasattr(args, 'hf_token') and args.hf_token:
+            sys.argv.extend(["--hf-token", args.hf_token])
+        if hasattr(args, 'task') and args.task:
+            sys.argv.extend(["--task", args.task])
+        if hasattr(args, 'language') and args.language:
+            sys.argv.extend(["--language", args.language])
+        if hasattr(args, 'batch_size') and args.batch_size is not None:
+            sys.argv.extend(["--batch-size", str(args.batch_size)])
+        if hasattr(args, 'flash') and args.flash is not None:
+            sys.argv.extend(["--flash", str(args.flash).lower()])
+        if hasattr(args, 'timestamp') and args.timestamp:
+            sys.argv.extend(["--timestamp", args.timestamp])
+        if hasattr(args, 'diarization_model') and args.diarization_model:
+            sys.argv.extend(["--diarization_model", args.diarization_model])
+        if hasattr(args, 'num_speakers') and args.num_speakers is not None:
+            sys.argv.extend(["--num-speakers", str(args.num_speakers)])
+        if hasattr(args, 'min_speakers') and args.min_speakers is not None:
+            sys.argv.extend(["--min-speakers", str(args.min_speakers)])
+        if hasattr(args, 'max_speakers') and args.max_speakers is not None:
+            sys.argv.extend(["--max-speakers", str(args.max_speakers)])
         
-        # Process audio for transcription
-        inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
-        input_features = inputs.input_features.to(device, dtype=torch.float16)
+        # Redirect stdout and stderr to capture output and avoid display conflicts
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            try:
+                cli_main()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+            finally:
+                # Restore original sys.argv
+                sys.argv = original_argv
         
-        # Generate transcription
-        start_time = time.time()
-        with torch.no_grad():
-            predicted_ids = model.generate(input_features)
-        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-        processing_time = time.time() - start_time
-        
-        # Return response
-        return JSONResponse(content={
-            "text": transcription,
-            "duration_sec": audio_duration,
-            "chunks": 1,
-            "timestamped": False
-        })
+        # Read the output JSON file generated by cli.py
+        if os.path.exists(temp_output_path):
+            with open(temp_output_path, 'r', encoding='utf8') as f:
+                result = json.load(f)
+            
+            # Extract relevant information for the response
+            text = result.get('text', '')
+            duration_sec = result.get('duration_sec', 0.0)
+            chunks = result.get('chunks', [])
+            timestamped = len(chunks) > 1
+            diarization = result.get('diarization', [])
+            
+            return JSONResponse(content={
+                "text": text,
+                "duration_sec": duration_sec,
+                "chunks": chunks,
+                "timestamped": timestamped,
+                "diarization": diarization
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Transcription output file not found.")
     finally:
-        # Clean up temporary file
+        # Clean up temporary files
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FastAPI server for Whisper transcription")
     parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to run the server on")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 8000)), help="Port to run the server on")
-    parser.add_argument("--xpu", action="store_true", help="Force use of XPU device")
+    
+    # Add all arguments from cli.py parser to ensure compatibility
+    for action in cli_parser._actions:
+        if action.dest not in ['help', 'file_name', 'transcript_path']:  # Exclude file-specific args to be set per request
+            parser.add_argument(
+                action.option_strings[0] if action.option_strings else action.dest,
+                dest=action.dest,
+                type=action.type,
+                default=action.default if action.default is not None else os.getenv(action.dest.upper(), action.default),
+                help=action.help,
+                choices=action.choices
+            )
+    
     args = parser.parse_args()
+    
+    # Validate speaker arguments
+    if args.num_speakers is not None and (args.min_speakers is not None or args.max_speakers is not None):
+        parser.error("--num-speakers cannot be used together with --min-speakers or --max-speakers.")
+    if args.num_speakers is not None and args.num_speakers < 1:
+        parser.error("--num-speakers must be at least 1.")
+    if args.min_speakers is not None and args.min_speakers < 1:
+        parser.error("--min-speakers must be at least 1.")
+    if args.max_speakers is not None and args.max_speakers < 1:
+        parser.error("--max-speakers must be at least 1.")
+    if args.min_speakers is not None and args.max_speakers is not None and args.min_speakers > args.max_speakers:
+        parser.error("--min-speakers cannot be greater than --max-speakers.")
     
     uvicorn.run(app, host=args.host, port=args.port)
