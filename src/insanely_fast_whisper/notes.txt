@@ -1,0 +1,11 @@
+With this implementation also had to add 
+
+pip install ipex-llm==2.3.0b20250627
+source oneapi vars
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+--hf-token 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
+
+run command was 
+
+insanely-fast-whisper --model-name distil-whisper/medium.en --file-name Intro.m4a --hf-token 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 --device-id 'xpu'
+    resulted in transcription of greenparty.wav (17 minutes) in xxmins using distil-medium.en

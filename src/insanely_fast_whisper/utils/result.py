@@ -10,6 +10,6 @@ class JsonTranscriptionResult(TypedDict):
 def build_result(transcript, outputs) -> JsonTranscriptionResult:
     return {
         "speakers": transcript,
-        "chunks": outputs["chunks"],
-        "text": outputs["text"],
+        "chunks": outputs["segments"],
+        "text": "".join(segment["text"] for segment in outputs["segments"]),
     }

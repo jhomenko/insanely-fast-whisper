@@ -1,3 +1,9 @@
+[tool.pdm]
+sources = [
+    { name = "pytorch-xpu", url = "https://download.pytorch.org/whl/xpu", verify_ssl = true },
+    { name = "intel-ipex", url = "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/", verify_ssl = true }
+]
+
 [project]
 name = "insanely-fast-whisper"
 version = "0.0.15"
@@ -10,17 +16,33 @@ dependencies = [
     "transformers",
     "accelerate",
     "pyannote-audio>=3.1.0",
-    "setuptools>=68.2.2",
+    "setuptools>=70.0.0",
     "rich>=13.7.0",
+    "numpy>=1.26.4",
+    "idna>=3.7",
+    "ffmpeg",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "torchaudio==2.7.0",
+    "intel-extension-for-pytorch==2.7.10+xpu",
+    "oneccl-bind-pt==2.7.0+xpu",
+    "requests>=2.32.0",
+    "tqdm>=4.66.3",
+    "urllib3>=2.2.2",
+    "psutil==7.0.0",
+    "mkl==2025.0.1",
+    "mkl-include==2025.0.1",
+    "intel-openmp==2025.0.4",
+    "librosa>=0.10.0",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 readme = "README.md"
 license = { text = "MIT" }
 
 
 [build-system]
-requires = ["pdm-backend"]
-build-backend = "pdm.backend"
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project.scripts]
 insanely-fast-whisper = "insanely_fast_whisper.cli:main"
@@ -29,3 +51,6 @@ insanely-fast-whisper = "insanely_fast_whisper.cli:main"
 # Name based
 Homepage = "https://github.com/Vaibhavs10/insanely-fast-whisper"
 Twitter = "https://twitter.com/reach_vb"
+
+
+

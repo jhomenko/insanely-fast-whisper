@@ -11,9 +11,13 @@ def diarize(args, outputs):
         checkpoint_path=args.diarization_model,
         use_auth_token=args.hf_token,
     )
-    diarization_pipeline.to(
-        torch.device("mps" if args.device_id == "mps" else f"cuda:{args.device_id}")
-    )
+    if args.device_id == "mps":
+        device = "mps"
+    elif args.device_id == "xpu":
+        device = "xpu"
+    else:
+        device = f"cuda:{args.device_id}"
+    diarization_pipeline.to(torch.device(device))
 
     with Progress(
             TextColumn("🤗 [progress.description]{task.description}"),
@@ -27,5 +31,5 @@ def diarize(args, outputs):
         segments = diarize_audio(diarizer_inputs, diarization_pipeline, args.num_speakers, args.min_speakers, args.max_speakers)
 
         return post_process_segments_and_transcripts(
-            segments, outputs["chunks"], group_by_speaker=False
+            segments, outputs["segments"], group_by_speaker=False
         )

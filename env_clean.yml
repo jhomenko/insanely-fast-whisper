@@ -1,0 +1,6 @@
+name: insanely-fast-whisper-intel
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+prefix: /mnt/data/venvs/miniconda3/envs/insanely-fast-whisper-intel

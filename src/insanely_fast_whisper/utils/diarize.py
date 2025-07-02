@@ -11,14 +11,30 @@ import sys
 
 
 def preprocess_inputs(inputs):
+    import os
+    import subprocess
+    import tempfile
+
     if isinstance(inputs, str):
         if inputs.startswith("http://") or inputs.startswith("https://"):
             # We need to actually check for a real protocol, otherwise it's impossible to use a local file
             # like http_huggingface_co.png
             inputs = requests.get(inputs).content
         else:
-            with open(inputs, "rb") as f:
-                inputs = f.read()
+            # Check if the file extension is .m4a or other potentially unsupported formats
+            if os.path.splitext(inputs)[1].lower() in ['.m4a']:
+                # Create a temporary .wav file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    # Convert .m4a to .wav using ffmpeg
+                    subprocess.run(['ffmpeg', '-i', inputs, '-ac', '1', '-ar', '16000', '-y', temp_path], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    with open(temp_path, 'rb') as f:
+                        inputs = f.read()
+                    # Clean up temporary file
+                    os.unlink(temp_path)
+            else:
+                with open(inputs, 'rb') as f:
+                    inputs = f.read()
 
     if isinstance(inputs, bytes):
         inputs = ffmpeg_read(inputs, 16000)
@@ -52,7 +68,7 @@ def preprocess_inputs(inputs):
         )
 
     # diarization model expects float32 torch tensor of shape `(channels, seq_len)`
-    diarizer_inputs = torch.from_numpy(inputs).float()
+    diarizer_inputs = torch.from_numpy(inputs.copy()).float()
     diarizer_inputs = diarizer_inputs.unsqueeze(0)
 
     return inputs, diarizer_inputs
@@ -115,7 +131,7 @@ def diarize_audio(diarizer_inputs, diarization_pipeline, num_speakers, min_speak
 def post_process_segments_and_transcripts(new_segments, transcript, group_by_speaker) -> list:
     # get the end timestamps for each chunk from the ASR output
     end_timestamps = np.array(
-        [chunk["timestamp"][-1] if chunk["timestamp"][-1] is not None else sys.float_info.max for chunk in transcript])
+        [chunk["end"] for chunk in transcript])
     segmented_preds = []
 
     # align the diarizer timestamps and the ASR timestamps
@@ -133,8 +149,8 @@ def post_process_segments_and_transcripts(new_segments, transcript, group_by_spe
                         [chunk["text"] for chunk in transcript[: upto_idx + 1]]
                     ),
                     "timestamp": (
-                        transcript[0]["timestamp"][0],
-                        transcript[upto_idx]["timestamp"][1],
+                        transcript[0]["start"],
+                        transcript[upto_idx]["end"],
                     ),
                 }
             )

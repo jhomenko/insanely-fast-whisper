@@ -1,8 +1,12 @@
 import json
 import argparse
-from transformers import pipeline
+import time
+from transformers import WhisperProcessor
+from transformers import AutoModelForSpeechSeq2Seq
 from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
 import torch
+import librosa
+import numpy as np
 
 from .utils.diarization_pipeline import diarize
 from .utils.result import build_result
@@ -19,7 +23,7 @@ parser.add_argument(
     required=False,
     default="0",
     type=str,
-    help='Device ID for your GPU. Just pass the device number when using CUDA, or "mps" for Macs with Apple Silicon. (default: "0")',
+    help='Device ID for your GPU. Just pass the device number when using CUDA, "mps" for Macs with Apple Silicon, or "xpu" for Intel XPU devices. (default: "0")',
 )
 parser.add_argument(
     "--transcript-path",
@@ -54,8 +58,8 @@ parser.add_argument(
     "--batch-size",
     required=False,
     type=int,
-    default=24,
-    help="Number of parallel batches you want to compute. Reduce if you face OOMs. (default: 24)",
+    default=12,
+    help="Number of parallel batches you want to compute. Reduce if you face OOMs. (default: 12)",
 )
 parser.add_argument(
     "--flash",
@@ -127,18 +131,33 @@ def main():
         if args.min_speakers > args.max_speakers:
             parser.error("--min-speakers cannot be greater than --max-speakers.")
 
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=args.model_name,
+    # Load the model using Transformers
+    from transformers import AutoModelForSpeechSeq2Seq as TransformersAutoModel
+    model = TransformersAutoModel.from_pretrained(
+        args.model_name,
         torch_dtype=torch.float16,
-        device="mps" if args.device_id == "mps" else f"cuda:{args.device_id}",
-        model_kwargs={"attn_implementation": "flash_attention_2"} if args.flash else {"attn_implementation": "sdpa"},
+        use_cache=True
     )
-
+    
+    # Set model to eval mode before optimization
+    model.eval()
+    
+    # Optimize the model with intel_extension_for_pytorch LLM module
+    import intel_extension_for_pytorch as ipex
     if args.device_id == "mps":
-        torch.mps.empty_cache()
-    # elif not args.flash:
-        # pipe.model = pipe.model.to_bettertransformer()
+        device = "mps"
+    elif args.device_id == "xpu":
+        device = "xpu"
+    else:
+        device = f"cuda:{args.device_id}"
+    model = ipex.llm.optimize(model, dtype=torch.float16, device=device)
+    model.to(device)
+    print(f"Model moved to device: {device}")
+
+    if args.flash:
+        model.config.attn_implementation = "flash_attention_2"
+    else:
+        model.config.attn_implementation = "sdpa"
 
     ts = "word" if args.timestamp == "word" else True
 
@@ -156,13 +175,59 @@ def main():
     ) as progress:
         progress.add_task("[yellow]Transcribing...", total=None)
 
-        outputs = pipe(
-            args.file_name,
-            chunk_length_s=30,
-            batch_size=args.batch_size,
-            generate_kwargs=generate_kwargs,
-            return_timestamps=ts,
-        )
+        from transformers import WhisperProcessor
+        processor = WhisperProcessor.from_pretrained(args.model_name)
+
+        import librosa
+        audio, sr = librosa.load(args.file_name, sr=16000)
+        input_features = processor(audio, sampling_rate=sr, return_tensors="pt").input_features.to(device, dtype=torch.float16)
+        print(f"Input features moved to device: {device} with dtype: {input_features.dtype}")
+
+        # Use manual chunking with direct generate method for long-form transcription
+        start_time = time.time()
+        print("Starting transcription process...")
+        audio, sr = librosa.load(args.file_name, sr=16000)
+        audio_duration = len(audio) / sr
+        print(f"Audio loaded, length: {audio_duration:.2f} seconds")
+        
+        # Define chunk length (30 seconds is the max receptive field for Whisper)
+        chunk_length_s = 30
+        chunk_samples = chunk_length_s * sr
+        num_chunks = int(np.ceil(audio_duration / chunk_length_s))
+        print(f"Processing audio in {num_chunks} chunks of {chunk_length_s} seconds each")
+        
+        segments = []
+        for i in range(num_chunks):
+            start_sample = i * chunk_samples
+            end_sample = min((i + 1) * chunk_samples, len(audio))
+            chunk_audio = audio[start_sample:end_sample]
+            chunk_duration = (end_sample - start_sample) / sr
+            
+            print(f"Processing chunk {i+1}/{num_chunks} ({chunk_duration:.2f} seconds)")
+            chunk_start_time = time.time()
+            
+            # Extract features for the chunk
+            input_features = processor(chunk_audio, sampling_rate=sr, return_tensors="pt").input_features.to(device, dtype=torch.float16)
+            
+            # Generate transcription for the chunk
+            with torch.no_grad():
+                predicted_ids = model.generate(input_features, **generate_kwargs)
+            
+            # Decode the transcription
+            chunk_text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            
+            # Adjust timestamps to match the overall audio timeline
+            chunk_start_time_audio = start_sample / sr
+            segments.append({
+                'start': chunk_start_time_audio,
+                'end': chunk_start_time_audio + chunk_duration,
+                'text': chunk_text
+            })
+            
+            print(f"Chunk {i+1}/{num_chunks} processed in {time.time() - chunk_start_time:.2f} seconds")
+        
+        outputs = {'segments': segments}
+        print(f"Transcription completed in {time.time() - start_time:.2f} seconds for all {num_chunks} chunks")
 
     if args.hf_token != "no_token":
         speakers_transcript = diarize(args, outputs)
