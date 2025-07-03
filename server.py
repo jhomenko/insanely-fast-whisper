@@ -22,7 +22,6 @@ app = FastAPI(title="Insanely Fast Whisper API", description="API for audio tran
 # Global variable to store command-line arguments
 args = None
 
-@app.on_event("startup")
 async def startup_event():
     """Initialize server settings on startup."""
     global args
@@ -46,6 +45,9 @@ async def startup_event():
     
     args, _ = parser.parse_known_args()
     print(f"Server initialized with host: {args.host}, port: {args.port}")
+
+# Register the startup event using the lifespan handler
+app.add_event_handler("startup", startup_event)
 
 @app.post("/transcribe/")
 async def transcribe_audio(file: UploadFile = File(...)):
@@ -119,7 +121,10 @@ async def transcribe_audio(file: UploadFile = File(...)):
             try:
                 cli_main()
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+                import traceback
+                error_detail = f"Transcription failed: {str(e)}\nStacktrace:\n{traceback.format_exc()}"
+                print(error_detail)  # Log to console for debugging
+                raise HTTPException(status_code=500, detail=error_detail)
             finally:
                 # Restore original sys.argv
                 sys.argv = original_argv
@@ -130,7 +135,9 @@ async def transcribe_audio(file: UploadFile = File(...)):
                 result = json.load(f)
             return JSONResponse(content=result)
         else:
-            raise HTTPException(status_code=500, detail="Transcription output file not found.")
+            error_detail = "Transcription output file not found."
+            print(error_detail)  # Log to console for debugging
+            raise HTTPException(status_code=500, detail=error_detail)
     finally:
         # Clean up temporary files
         if os.path.exists(temp_file_path):

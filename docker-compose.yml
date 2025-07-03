@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  whisper-server:
+    image: insanely-fast-whisper
+    build: .
+    ports:
+      - "6543:8000"
+    environment:
+      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+    devices:
+      - /dev/dri:/dev/dri
+    command: ["python3", "server.py", "--host", "0.0.0.0", "--port", "8000", "--device-id", "xpu", "--batch-size", "6", "--vad-filter", "True", "--hf-token", "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", "--model-name", "distil-whisper/distil-large-v3", "--diarization_model", "pyannote/speaker-diarization-3.1"]
