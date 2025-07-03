@@ -8,8 +8,8 @@ from rich.progress import Progress, TimeElapsedColumn, BarColumn, TextColumn
 import librosa
 import numpy as np
 
-from .utils.diarization_pipeline import diarize
-from .utils.result import build_result
+from insanely_fast_whisper.utils.diarization_pipeline import diarize
+from insanely_fast_whisper.utils.result import build_result
 
 parser = argparse.ArgumentParser(description="Automatic Speech Recognition")
 parser.add_argument(
@@ -156,6 +156,7 @@ parser.add_argument(
 
 def main():
     args = parser.parse_args()
+    print("Parsed command line arguments:", vars(args))
 
     if args.num_speakers is not None and (args.min_speakers is not None or args.max_speakers is not None):
         parser.error("--num-speakers cannot be used together with --min-speakers or --max-speakers.")
@@ -175,12 +176,14 @@ def main():
 
     # Load the model using Transformers
     from transformers import AutoModelForSpeechSeq2Seq as TransformersAutoModel
+    print("Loading model...")
     model = TransformersAutoModel.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
         use_cache=True,
         use_auth_token=args.hf_token if args.hf_token != "no_token" else None
     )
+    print("Model loaded successfully.")
     
     # Set model to eval mode before optimization
     model.eval()
@@ -193,6 +196,7 @@ def main():
         device = "xpu"
     else:
         device = f"cuda:{args.device_id}"
+    print("Optimizing model for device:", device)
     model = ipex.llm.optimize(model, dtype=torch.float16, device=device)
     model.to(device)
     print(f"Model moved to device: {device}")
@@ -202,7 +206,7 @@ def main():
     else:
         model.config.attn_implementation = "sdpa"
 
-    ts = "word" if args.timestamp == "word" else True
+    ts = True if args.timestamp == "chunk" else "word"
 
     language = None if args.language == "None" else args.language
 
@@ -217,22 +221,29 @@ def main():
         TimeElapsedColumn(),
     ) as progress:
         progress.add_task("[yellow]Transcribing...", total=None)
+        print("Progress bar initialized.")
 
-        from transformers import WhisperProcessor
+        from transformers import WhisperProcessor, pipeline
+        print("Loading WhisperProcessor...")
         processor = WhisperProcessor.from_pretrained(
             args.model_name,
             use_auth_token=args.hf_token if args.hf_token != "no_token" else None
         )
+        print("WhisperProcessor loaded.")
 
         import librosa
         import os
-        import numpy as np
         # Check if file_name is a relative path and prepend 'input' folder if so
         if not os.path.isabs(args.file_name) and not args.file_name.startswith('http'):
             args.file_name = os.path.join('input', args.file_name)
-        audio, sr = librosa.load(args.file_name, sr=16000)
-        audio_duration = len(audio) / sr
-        print(f"Audio loaded from {args.file_name}, length: {audio_duration:.2f} seconds")
+        print(f"Loading audio file: {args.file_name}")
+        try:
+            audio, sr = librosa.load(args.file_name, sr=16000)
+            audio_duration = len(audio) / sr
+            print(f"Audio loaded from {args.file_name}, length: {audio_duration:.2f} seconds")
+        except Exception as e:
+            print(f"Error loading audio file: {str(e)}")
+            return
 
         # Voice Activity Detection (VAD) pre-processing if enabled
         speech_chunks = []
@@ -264,12 +275,28 @@ def main():
         else:
             speech_chunks = [(0.0, audio_duration)]
 
-        # Process audio input for long-form transcription
+        # Set up the pipeline for long-form transcription with built-in chunking
         start_time = time.time()
-        print("Starting transcription process...")
-        model.generation_config.max_new_tokens = 256
+        print("Starting transcription process using built-in chunking...")
+        print("Setting up pipeline...")
+        try:
+            pipe = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                chunk_length_s=25,  # Set chunk length to 25 seconds
+                stride_length_s=(5, 5),  # Set stride to 5 seconds for overlap (left, right)
+                batch_size=args.batch_size,
+                torch_dtype=torch.float16,
+                device=device,
+            )
+            print("Pipeline setup completed.")
+        except Exception as e:
+            print(f"Error setting up pipeline: {str(e)}")
+            return
 
-        # Update generate_kwargs with long-form transcription parameters
+        # Update generate_kwargs for long-form transcription
         generate_kwargs.update({
             "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
             "logprob_threshold": -1.0,
@@ -281,99 +308,41 @@ def main():
             "no_speech_threshold": 0.6
         })
 
-        # Define chunk length (30 seconds is the max receptive field for Whisper)
-        chunk_length_s = 30
-        chunk_samples = chunk_length_s * sr
-        num_chunks = int(np.ceil(audio_duration / chunk_length_s))
-        print(f"Processing audio in {num_chunks} chunks of {chunk_length_s} seconds each")
+        # Process audio using the pipeline with built-in chunking
+        print("Processing audio with pipeline...")
+        try:
+            result = pipe(audio, generate_kwargs=generate_kwargs)
+            print(f"Transcription completed in {time.time() - start_time:.2f} seconds")
+        except Exception as e:
+            print(f"Error during transcription: {str(e)}")
+            return
 
-        segments = []
-        for i in range(0, num_chunks, args.batch_size):
-            batch_start = i
-            batch_end = min(i + args.batch_size, num_chunks)
-            batch_input_features = []
-            batch_attention_masks = []
-            for j in range(batch_start, batch_end):
-                start_sample = j * chunk_samples
-                end_sample = min((j + 1) * chunk_samples, len(audio))
-                chunk_audio = audio[start_sample:end_sample]
-                chunk_duration = (end_sample - start_sample) / sr
-                
-                print(f"Preparing chunk {j+1}/{num_chunks} ({chunk_duration:.2f} seconds)")
-                
-                # Extract features for the chunk
-                inputs = processor(chunk_audio, sampling_rate=sr, return_tensors="pt", truncation=False, padding="longest", return_attention_mask=True)
-                batch_input_features.append(inputs.input_features)
-                if hasattr(inputs, 'attention_mask'):
-                    batch_attention_masks.append(inputs.attention_mask)
-                else:
-                    batch_attention_masks.append(None)
-            
-            # Stack batch inputs with padding if necessary
-            if len(batch_input_features) > 1:
-                # Find the maximum size for padding
-                max_size = max(f.shape[-1] for f in batch_input_features)
-                padded_features = []
-                for f in batch_input_features:
-                    if f.shape[-1] < max_size:
-                        pad_size = max_size - f.shape[-1]
-                        f_padded = torch.nn.functional.pad(f, (0, pad_size), mode='constant', value=0)
-                        padded_features.append(f_padded)
-                    else:
-                        padded_features.append(f)
-                batch_input_features = torch.cat(padded_features, dim=0).to(device, dtype=torch.float16)
-            else:
-                batch_input_features = batch_input_features[0].to(device, dtype=torch.float16)
-
-            if any(mask is not None for mask in batch_attention_masks):
-                if len(batch_attention_masks) > 1:
-                    # Pad attention masks if necessary
-                    max_size = max(m.shape[-1] for m in batch_attention_masks if m is not None)
-                    padded_masks = []
-                    for m in batch_attention_masks:
-                        if m is not None and m.shape[-1] < max_size:
-                            pad_size = max_size - m.shape[-1]
-                            m_padded = torch.nn.functional.pad(m, (0, pad_size), mode='constant', value=0)
-                            padded_masks.append(m_padded)
-                        elif m is not None:
-                            padded_masks.append(m)
-                    batch_attention_masks = torch.cat(padded_masks, dim=0).to(device)
-                else:
-                    batch_attention_masks = batch_attention_masks[0].to(device) if batch_attention_masks[0] is not None else None
-            else:
-                batch_attention_masks = None
-            
-            print(f"Processing batch of chunks {batch_start+1} to {batch_end}/{num_chunks}")
-            batch_start_time = time.time()
-            
-            # Generate transcription for the batch
-            with torch.no_grad():
-                if batch_attention_masks is not None:
-                    batch_predicted_ids = model.generate(batch_input_features, attention_mask=batch_attention_masks, **generate_kwargs)
-                else:
-                    batch_predicted_ids = model.generate(batch_input_features, **generate_kwargs)
-            
-            print(f"Batch processed in {time.time() - batch_start_time:.2f} seconds")
-            
-            # Decode the transcriptions for each chunk in the batch
-            batch_texts = processor.batch_decode(batch_predicted_ids, skip_special_tokens=True)
-            for j, chunk_text in enumerate(batch_texts):
-                chunk_idx = batch_start + j
-                chunk_start_time_audio = (chunk_idx * chunk_samples) / sr
-                chunk_end_time_audio = min(((chunk_idx + 1) * chunk_samples) / sr, audio_duration)
-                segments.append({
-                    'start': chunk_start_time_audio,
-                    'end': chunk_end_time_audio,
-                    'text': chunk_text
-                })
-                print(f"Chunk {chunk_idx+1}/{num_chunks} transcribed: {chunk_text[:50]}...")
-        
-        # Prepare outputs for diarization or final result
-        outputs = {'segments': segments}
-        print(f"Transcription completed in {time.time() - start_time:.2f} seconds for all {num_chunks} chunks")
+        # Extract segments from the pipeline result
+        if "chunks" in result:
+            outputs = {
+                'segments': [
+                    {"start": chunk["timestamp"][0], "end": chunk["timestamp"][1], "text": chunk["text"]}
+                    for chunk in result["chunks"]
+                    if chunk["timestamp"][0] is not None and chunk["timestamp"][1] is not None
+                ],
+                'text': result.get("text", "")
+            }
+        else:
+            outputs = {
+                'segments': [{"start": 0.0, "end": audio_duration, "text": result["text"]}],
+                'text': result["text"]
+            }
+        # Save transcription output to a separate JSON file for review
+        with open("output/transcript.json", "w", encoding="utf8") as fp:
+            json.dump(outputs, fp, ensure_ascii=False)
+        print("Transcription output saved to output/transcript.json for schema review.")
 
     if args.hf_token != "no_token":
         speakers_transcript = diarize(args, outputs)
+        # Save diarization output to a separate JSON file for review
+        with open("output/diarization.json", "w", encoding="utf8") as fp:
+            json.dump(speakers_transcript, fp, ensure_ascii=False)
+        print("Diarization output saved to output/diarization.json for schema review.")
         with open(args.transcript_path, "w", encoding="utf8") as fp:
             result = build_result(speakers_transcript, outputs)
             json.dump(result, fp, ensure_ascii=False)
