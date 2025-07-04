@@ -129,19 +129,9 @@ def diarize_audio(diarizer_inputs, diarization_pipeline, num_speakers, min_speak
 
 
 def post_process_segments_and_transcripts(new_segments, transcript, group_by_speaker) -> list:
-    # Handle the transcript structure based on pipeline output
-    if isinstance(transcript, dict) and "chunks" in transcript:
-        chunks = transcript["chunks"]
-    elif isinstance(transcript, list):
-        chunks = transcript
-    else:
-        return []
-
     # get the end timestamps for each chunk from the ASR output
-    import sys
     end_timestamps = np.array(
-        [chunk["timestamp"][1] if "timestamp" in chunk and len(chunk["timestamp"]) > 1 and chunk["timestamp"][1] is not None else sys.float_info.max for chunk in chunks]
-    )
+        [chunk["end"] for chunk in transcript])
     segmented_preds = []
 
     # align the diarizer timestamps and the ASR timestamps
@@ -149,8 +139,6 @@ def post_process_segments_and_transcripts(new_segments, transcript, group_by_spe
         # get the diarizer end timestamp
         end_time = segment["segment"]["end"]
         # find the ASR end timestamp that is closest to the diarizer's end timestamp and cut the transcript to here
-        if len(end_timestamps) == 0:
-            break
         upto_idx = np.argmin(np.abs(end_timestamps - end_time))
 
         if group_by_speaker:
@@ -158,20 +146,23 @@ def post_process_segments_and_transcripts(new_segments, transcript, group_by_spe
                 {
                     "speaker": segment["speaker"],
                     "text": "".join(
-                        [chunk["text"] for chunk in chunks[: upto_idx + 1]]
+                        [chunk["text"] for chunk in transcript[: upto_idx + 1]]
                     ),
                     "timestamp": (
-                        chunks[0]["timestamp"][0] if "timestamp" in chunks[0] and len(chunks[0]["timestamp"]) > 0 else 0.0,
-                        chunks[upto_idx]["timestamp"][1] if "timestamp" in chunks[upto_idx] and len(chunks[upto_idx]["timestamp"]) > 1 else 0.0,
+                        transcript[0]["start"],
+                        transcript[upto_idx]["end"],
                     ),
                 }
             )
         else:
             for i in range(upto_idx + 1):
-                segmented_preds.append({"speaker": segment["speaker"], **chunks[i]})
+                segmented_preds.append({"speaker": segment["speaker"], **transcript[i]})
 
         # crop the transcripts and timestamp lists according to the latest timestamp (for faster argmin)
-        chunks = chunks[upto_idx + 1:]
+        transcript = transcript[upto_idx + 1:]
         end_timestamps = end_timestamps[upto_idx + 1:]
+
+        if len(end_timestamps) == 0:
+            break 
 
     return segmented_preds

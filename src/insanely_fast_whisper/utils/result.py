@@ -10,10 +10,12 @@ class JsonTranscriptionResult(TypedDict):
 def build_result(transcript, outputs) -> JsonTranscriptionResult:
     if transcript:
         return {
-            "speakers": transcript
+            "speakers": transcript,
+            "chunks": transcript,  # Use the diarized transcript as chunks
+            "text": outputs.get("text", "")
         }
     else:
         return {
-            "chunks": outputs["segments"],
-            "text": "".join(segment["text"] for segment in outputs["segments"])
+            "chunks": outputs.get("chunks", []),
+            "text": outputs.get("text", "")
         }

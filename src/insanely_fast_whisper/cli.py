@@ -206,7 +206,38 @@ def main():
     else:
         model.config.attn_implementation = "sdpa"
 
-    ts = True if args.timestamp == "chunk" else "word"
+    from transformers import pipeline, WhisperProcessor
+    
+    # Load processor for tokenizer and feature extractor
+    print("Loading WhisperProcessor...")
+    processor = WhisperProcessor.from_pretrained(
+        args.model_name,
+        use_auth_token=args.hf_token if args.hf_token != "no_token" else None
+    )
+    print("WhisperProcessor loaded.")
+    
+    # Set up the pipeline for long-form transcription with built-in chunking
+    start_time = time.time()
+    print("Starting transcription process using built-in chunking...")
+    print("Setting up pipeline...")
+    try:
+        pipe = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            chunk_length_s=25,  # Set chunk length to 25 seconds
+            stride_length_s=(5, 5),  # Set stride to 5 seconds for overlap (left, right)
+            batch_size=args.batch_size,
+            torch_dtype=torch.float16,
+            device=device,
+        )
+        print("Pipeline setup completed.")
+    except Exception as e:
+        print(f"Error setting up pipeline: {str(e)}")
+        return
+
+    ts = "word" if args.timestamp == "word" else True
 
     language = None if args.language == "None" else args.language
 
@@ -215,27 +246,30 @@ def main():
     if args.model_name.split(".")[-1] == "en":
         generate_kwargs.pop("task")
 
+    # Update generate_kwargs for long-form transcription
+    generate_kwargs.update({
+        "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        "logprob_threshold": -1.0,
+        "compression_ratio_threshold": 1.35,
+        "max_new_tokens": 256,
+        "num_beams": 1,
+        "condition_on_prev_tokens": False,
+        "no_speech_threshold": 0.6
+    })
+
     with Progress(
         TextColumn("🤗 [progress.description]{task.description}"),
         BarColumn(style="yellow1", pulse_style="white"),
         TimeElapsedColumn(),
     ) as progress:
         progress.add_task("[yellow]Transcribing...", total=None)
-        print("Progress bar initialized.")
 
-        from transformers import WhisperProcessor, pipeline
-        print("Loading WhisperProcessor...")
-        processor = WhisperProcessor.from_pretrained(
-            args.model_name,
-            use_auth_token=args.hf_token if args.hf_token != "no_token" else None
-        )
-        print("WhisperProcessor loaded.")
-
-        import librosa
-        import os
         # Check if file_name is a relative path and prepend 'input' folder if so
+        import os
+        import librosa
         if not os.path.isabs(args.file_name) and not args.file_name.startswith('http'):
             args.file_name = os.path.join('input', args.file_name)
+        
         print(f"Loading audio file: {args.file_name}")
         try:
             audio, sr = librosa.load(args.file_name, sr=16000)
@@ -245,93 +279,16 @@ def main():
             print(f"Error loading audio file: {str(e)}")
             return
 
-        # Voice Activity Detection (VAD) pre-processing if enabled
-        speech_chunks = []
-        if args.vad_filter:
-            print("Applying Voice Activity Detection to filter silent parts...")
-            try:
-                vad_model, vad_utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=False, trust_repo=True)
-                get_speech_timestamps, _, _, _, _ = vad_utils
-                audio_tensor = torch.from_numpy(audio).float()
-                speech_timestamps = get_speech_timestamps(
-                    audio_tensor,
-                    vad_model,
-                    sampling_rate=sr,
-                    threshold=args.vad_threshold,
-                    min_speech_duration_ms=args.vad_min_speech_duration_ms,
-                    max_speech_duration_s=args.vad_max_speech_duration_s,
-                    min_silence_duration_ms=args.vad_min_silence_duration_ms,
-                    speech_pad_ms=args.vad_speech_pad_ms
-                )
-                speech_chunks = [(ts['start'] / sr, ts['end'] / sr) for ts in speech_timestamps]
-                if not speech_chunks:
-                    print("No speech detected after VAD. Proceeding with full audio.")
-                    speech_chunks = [(0.0, audio_duration)]
-                else:
-                    print(f"Detected {len(speech_chunks)} speech segments after VAD.")
-            except Exception as e:
-                print(f"Failed to apply VAD: {str(e)}. Proceeding with full audio.")
-                speech_chunks = [(0.0, audio_duration)]
-        else:
-            speech_chunks = [(0.0, audio_duration)]
-
-        # Set up the pipeline for long-form transcription with built-in chunking
-        start_time = time.time()
-        print("Starting transcription process using built-in chunking...")
-        print("Setting up pipeline...")
-        try:
-            pipe = pipeline(
-                "automatic-speech-recognition",
-                model=model,
-                tokenizer=processor.tokenizer,
-                feature_extractor=processor.feature_extractor,
-                chunk_length_s=25,  # Set chunk length to 25 seconds
-                stride_length_s=(5, 5),  # Set stride to 5 seconds for overlap (left, right)
-                batch_size=args.batch_size,
-                torch_dtype=torch.float16,
-                device=device,
-            )
-            print("Pipeline setup completed.")
-        except Exception as e:
-            print(f"Error setting up pipeline: {str(e)}")
-            return
-
-        # Update generate_kwargs for long-form transcription
-        generate_kwargs.update({
-            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            "logprob_threshold": -1.0,
-            "compression_ratio_threshold": 1.35,
-            "return_timestamps": True if args.timestamp == "chunk" else "word",
-            "max_new_tokens": 256,
-            "num_beams": 1,
-            "condition_on_prev_tokens": False,
-            "no_speech_threshold": 0.6
-        })
-
         # Process audio using the pipeline with built-in chunking
         print("Processing audio with pipeline...")
         try:
-            result = pipe(audio, generate_kwargs=generate_kwargs)
+            outputs = pipe(audio, return_timestamps=ts, generate_kwargs=generate_kwargs)
             print(f"Transcription completed in {time.time() - start_time:.2f} seconds")
+            print(outputs)
         except Exception as e:
             print(f"Error during transcription: {str(e)}")
             return
 
-        # Extract segments from the pipeline result
-        if "chunks" in result:
-            outputs = {
-                'segments': [
-                    {"start": chunk["timestamp"][0], "end": chunk["timestamp"][1], "text": chunk["text"]}
-                    for chunk in result["chunks"]
-                    if chunk["timestamp"][0] is not None and chunk["timestamp"][1] is not None
-                ],
-                'text': result.get("text", "")
-            }
-        else:
-            outputs = {
-                'segments': [{"start": 0.0, "end": audio_duration, "text": result["text"]}],
-                'text': result["text"]
-            }
         # Save transcription output to a separate JSON file for review
         with open("output/transcript.json", "w", encoding="utf8") as fp:
             json.dump(outputs, fp, ensure_ascii=False)
