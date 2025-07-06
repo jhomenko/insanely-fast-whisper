@@ -169,13 +169,6 @@ def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model:
             audio_tensor = audio_tensor.unsqueeze(0).unsqueeze(0)  # Convert to (1, 1, samples) for mono (shouldn't happen due to stereo conversion)
         print(f"Audio tensor shape for processing: {audio_tensor.shape}")
         
-        # Limit to first 10 seconds for diagnostic purposes during testing
-        max_duration_s = 10
-        max_samples = max_duration_s * target_sample_rate
-        if audio_tensor.shape[-1] > max_samples:
-            audio_tensor = audio_tensor[:, :, :max_samples]
-            print(f"Limited audio to first {max_duration_s} seconds for diagnostic testing. New length: {audio_tensor.shape[-1]} samples")
-        
         # Process audio using Hybrid Demucs with chunking to manage memory
         sources = separate_sources(model, audio_tensor, segment=10.0, overlap=0.1, device=device, fade_class=fade_class)
         
