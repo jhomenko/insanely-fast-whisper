@@ -6,7 +6,15 @@ from .diarize import post_process_segments_and_transcripts, diarize_audio, \
     preprocess_inputs
 
 
-def diarize(args, outputs):
+def diarize(args, outputs, audio_duration=None):
+    # Workaround for PyTorch unpickling error with weights_only=True in newer versions
+    torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+    # Add pyannote.audio.core.task.Resolution to safe globals as required by error message
+    try:
+        from pyannote.audio.core.task import Resolution, Specifications, Problem
+        torch.serialization.add_safe_globals([Resolution, Specifications, Problem])
+    except ImportError:
+        print("Could not import Resolution, Specifications, or Problem from pyannote.audio.core.task for safe globals.")
     diarization_pipeline = Pipeline.from_pretrained(
         checkpoint_path=args.diarization_model,
         use_auth_token=args.hf_token,
@@ -30,6 +38,17 @@ def diarize(args, outputs):
 
         segments = diarize_audio(diarizer_inputs, diarization_pipeline, args.num_speakers, args.min_speakers, args.max_speakers)
 
-        return post_process_segments_and_transcripts(
-            segments, outputs, group_by_speaker=False
-        )
+    # Limit diarization segments to match the audio duration used for transcription if provided
+    if audio_duration is not None:
+        new_segments = [
+            seg for seg in new_segments
+            if seg["segment"]["start"] <= audio_duration
+        ]
+        for seg in new_segments:
+            if seg["segment"]["end"] > audio_duration:
+                seg["segment"]["end"] = audio_duration
+        print(f"Limited diarization segments to match audio duration of {audio_duration:.2f} seconds. Resulting segments: {len(new_segments)}")
+
+    return post_process_segments_and_transcripts(
+        new_segments, outputs["chunks"], group_by_speaker=False
+    )

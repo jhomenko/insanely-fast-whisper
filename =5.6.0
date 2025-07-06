@@ -1,0 +1,9 @@
+Collecting ultimatevocalremover
+  Using cached ultimatevocalremover-5.6.1-py3-none-any.whl.metadata (13 kB)
+Using cached ultimatevocalremover-5.6.1-py3-none-any.whl (18.9 MB)
+Installing collected packages: ultimatevocalremover
+  Attempting uninstall: ultimatevocalremover
+    Found existing installation: ultimatevocalremover 5.6.1
+    Uninstalling ultimatevocalremover-5.6.1:
+      Successfully uninstalled ultimatevocalremover-5.6.1
+Successfully installed ultimatevocalremover-5.6.1

@@ -79,8 +79,8 @@ parser.add_argument(
     "--vad-threshold",
     required=False,
     type=float,
-    default=0.5,
-    help="Threshold for Voice Activity Detection (between 0 and 1). Higher values are stricter. (default: 0.5)",
+    default=0.3,
+    help="Threshold for Voice Activity Detection (between 0 and 1). Lower values are more lenient. (default: 0.3)",
 )
 parser.add_argument(
     "--vad-min-speech-duration-ms",
@@ -152,6 +152,35 @@ parser.add_argument(
     default=None,
     type=int,
     help="Defines the maximum number of speakers that the system should consider in diarization. Must be at least 1. Cannot be used together with --num-speakers. Must be greater than or equal to --min-speakers if both are specified. (default: None)",
+)
+parser.add_argument(
+    "--vocal-removal",
+    required=False,
+    type=bool,
+    default=False,
+    help="Enable vocal removal to separate vocals from background music before transcription. (default: False)",
+)
+parser.add_argument(
+    "--vocal-method",
+    required=False,
+    default="uvr",
+    type=str,
+    choices=["uvr", "hdemucs"],
+    help="Method for vocal removal: 'uvr' for Ultimate Vocal Remover API or 'hdemucs' for torchaudio Hybrid Demucs. (default: uvr)",
+)
+parser.add_argument(
+    "--vocal-model",
+    required=False,
+    type=str,
+    default="UVR-MDX-NET-Inst_HQ_4",
+    help="Name of the UVR model for vocal removal when using 'uvr' method. (default: UVR-MDX-NET-Inst_HQ_4)",
+)
+parser.add_argument(
+    "--vocal-model-dir",
+    required=False,
+    type=str,
+    default="./uvr_models",
+    help="Directory to store UVR models for vocal removal when using 'uvr' method. (default: ./uvr_models)",
 )
 
 def main():
@@ -237,7 +266,7 @@ def main():
         print(f"Error setting up pipeline: {str(e)}")
         return
 
-    ts = "word" if args.timestamp == "word" else True
+    ts = True  # Use chunk-level timestamps, passed within generate_kwargs
 
     language = None if args.language == "None" else args.language
 
@@ -246,16 +275,9 @@ def main():
     if args.model_name.split(".")[-1] == "en":
         generate_kwargs.pop("task")
 
-    # Update generate_kwargs for long-form transcription
-    generate_kwargs.update({
-        "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-        "logprob_threshold": -1.0,
-        "compression_ratio_threshold": 1.35,
-        "max_new_tokens": 256,
-        "num_beams": 1,
-        "condition_on_prev_tokens": False,
-        "no_speech_threshold": 0.6
-    })
+    # Keep generate_kwargs minimal to match original implementation
+    # No additional parameters beyond task and language
+    pass
 
     with Progress(
         TextColumn("🤗 [progress.description]{task.description}"),
@@ -279,15 +301,72 @@ def main():
             print(f"Error loading audio file: {str(e)}")
             return
 
+        # Pre-process audio with VAD if enabled
+        if args.vad_filter:
+            try:
+                from insanely_fast_whisper.utils.silero import get_speech_timestamps, apply_vad_filter
+                print("Applying Voice Activity Detection to filter silent parts...")
+                speech_timestamps = get_speech_timestamps(
+                    audio,
+                    sr,
+                    threshold=args.vad_threshold,
+                    min_speech_duration_ms=args.vad_min_speech_duration_ms,
+                    max_speech_duration_s=args.vad_max_speech_duration_s,
+                    min_silence_duration_ms=args.vad_min_silence_duration_ms,
+                    speech_pad_ms=args.vad_speech_pad_ms
+                )
+                if not speech_timestamps:
+                    print("No speech detected after VAD. Proceeding with full audio.")
+                else:
+                    print(f"Detected {len(speech_timestamps)} speech segments after VAD.")
+                    audio = apply_vad_filter(audio, sr, speech_timestamps)
+            except Exception as e:
+                print(f"Failed to apply VAD: {str(e)}. Proceeding with original audio.")
+
+        # Pre-process audio with vocal removal if enabled
+        if args.vocal_removal:
+            try:
+                if args.vocal_method == "uvr":
+                    from insanely_fast_whisper.utils.uvr import apply_vocal_removal
+                    print("Applying vocal removal using UVR method to isolate speech...")
+                    audio = apply_vocal_removal(audio, sr, model_name=args.vocal_model, model_dir=args.vocal_model_dir, device_id=args.device_id)
+                else:  # hdemucs
+                    from insanely_fast_whisper.utils.hdemucs import apply_hdemucs_vocal_separation
+                    print("Applying vocal removal using Hybrid Demucs method to isolate speech...")
+                    audio = apply_hdemucs_vocal_separation(audio, sr, device_id=args.device_id)
+                print("Vocal removal completed.")
+                # Update audio duration after vocal removal for consistency in subsequent steps
+                audio_duration = len(audio) / sr
+                print(f"Updated audio duration after vocal removal: {audio_duration:.2f} seconds")
+            except Exception as e:
+                print(f"Failed to apply vocal removal: {str(e)}. Proceeding with original audio.")
+
         # Process audio using the pipeline with built-in chunking
         print("Processing audio with pipeline...")
+        print(f"Audio input stats before transcription - Length: {len(audio)} samples, Sample rate: {sr} Hz")
         try:
-            outputs = pipe(audio, return_timestamps=ts, generate_kwargs=generate_kwargs)
+            outputs = pipe(audio, generate_kwargs=generate_kwargs, return_timestamps=ts)
             print(f"Transcription completed in {time.time() - start_time:.2f} seconds")
-            print(outputs)
+            print("Raw transcription output structure:", type(outputs))
+            print("Raw transcription output content:", outputs)
+            # Check if outputs is empty or not in expected format
+            if not outputs:
+                print("Error: Transcription output is empty. Saving empty result.")
+                outputs = {"text": "", "chunks": []}
+            elif not isinstance(outputs, dict):
+                print("Error: Transcription output is not a dictionary. Saving empty result.")
+                outputs = {"text": "", "chunks": []}
+            elif "text" not in outputs:
+                print("Error: 'text' key not found in transcription output. Saving empty result.")
+                outputs = {"text": "", "chunks": []}
+            elif "chunks" not in outputs or not outputs.get("chunks"):
+                print("Warning: 'chunks' key missing or empty in transcription output. Adding empty chunks.")
+                outputs["chunks"] = []
         except Exception as e:
-            print(f"Error during transcription: {str(e)}")
-            return
+            print(f"Error during transcription: {str(e)}. This may be due to parameter configuration issues with the pipeline. Detailed traceback:")
+            import traceback
+            traceback.print_exc()
+            outputs = {"text": "", "chunks": []}
 
         # Save transcription output to a separate JSON file for review
         with open("output/transcript.json", "w", encoding="utf8") as fp:
@@ -295,7 +374,8 @@ def main():
         print("Transcription output saved to output/transcript.json for schema review.")
 
     if args.hf_token != "no_token":
-        speakers_transcript = diarize(args, outputs)
+        # Limit diarization to match the audio duration used for transcription if audio was limited
+        speakers_transcript = diarize(args, outputs, audio_duration=audio_duration)
         # Save diarization output to a separate JSON file for review
         with open("output/diarization.json", "w", encoding="utf8") as fp:
             json.dump(speakers_transcript, fp, ensure_ascii=False)
