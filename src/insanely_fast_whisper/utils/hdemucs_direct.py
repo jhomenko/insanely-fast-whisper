@@ -3,20 +3,21 @@ import torch
 import numpy as np
 from typing import Optional
 
-def get_hdemucs_separator(device_id: str = "0") -> object:
+def get_hdemucs_separator(device_id: str = "0", model_name: str = "htdemucs_ft") -> object:
     """
-    Load the Hybrid Demucs model for vocal separation using torchaudio's pre-trained pipeline.
+    Load the Hybrid Transformer Demucs model for vocal separation using the direct Demucs API.
     
     Args:
         device_id: Device ID from CLI argument to determine the device for processing.
+        model_name: Name of the Demucs model variant to load (default: htdemucs_ft for fine-tuned Hybrid Transformer Demucs).
     
     Returns:
-        Hybrid Demucs model instance for vocal separation.
+        Demucs model instance for vocal separation.
     """
     try:
-        from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS
+        from demucs.api import Separator
         from torchaudio.transforms import Fade
-        print("Debug: torchaudio library and HDEMUCS pipeline imported successfully.")
+        print("Debug: Demucs library imported successfully.")
         
         # Device selection
         if device_id == "xpu" and torch.xpu.is_available():
@@ -27,11 +28,12 @@ def get_hdemucs_separator(device_id: str = "0") -> object:
             device = f"cuda:{device_id}" if device_id.isdigit() else "cuda:0"
         else:
             device = "cpu"
-        print(f"Loading Hybrid Demucs model on {device}...")
+        print(f"Loading Hybrid Transformer Demucs model '{model_name}' on {device}...")
         
-        # Load the pre-trained model
-        bundle = HDEMUCS_HIGH_MUSDB_PLUS
-        model = bundle.get_model()
+        # Load the pre-trained model using Demucs Separator
+        separator = Separator(model=model_name, device=device, split=True, overlap=0.25, progress=True)
+        model = separator.model
+        sample_rate = separator.samplerate
         
         # Set model to eval mode before optimization
         model.eval()
@@ -40,31 +42,32 @@ def get_hdemucs_separator(device_id: str = "0") -> object:
         try:
             if device == "xpu":
                 import intel_extension_for_pytorch as ipex
-                print("Optimizing Hybrid Demucs model with IPEX for XPU...")
-                model = ipex.optimize(model, dtype=torch.float, level='O1', weights_prepack=False, optimize_lstm=False)
+                print("Optimizing Hybrid Demucs model with IPEX for XPU using ipex.llm.optimize...")
+                model = ipex.llm.optimize(model, dtype=torch.float, device=device)
                 print("Hybrid Demucs model optimized with IPEX.")
         except Exception as e:
             print(f"Failed to optimize Hybrid Demucs model with IPEX: {str(e)}. Proceeding without IPEX optimization.")
         
         model.to(device)
-        print(f"Hybrid Demucs model loaded successfully on {device}. Sample rate: {bundle.sample_rate} Hz")
+        print(f"Hybrid Demucs model loaded successfully on {device}. Sample rate: {sample_rate} Hz")
         
-        return {"model": model, "sample_rate": bundle.sample_rate, "device": device, "fade": Fade}
+        return {"model": model, "separator": separator, "sample_rate": sample_rate, "device": device, "fade": Fade}
     except (ImportError, Exception) as e:
-        print(f"Debug: Failed to import torchaudio or load HDEMUCS model: {str(e)}")
-        raise ImportError("torchaudio library not detected or incompatible. Ensure 'torchaudio' is installed correctly (e.g., via 'pip install torchaudio'). Attempting fallback to original audio.")
+        print(f"Debug: Failed to import Demucs or load model '{model_name}': {str(e)}")
+        raise ImportError("Demucs library not detected or incompatible. Ensure 'demucs' is installed correctly (e.g., via 'pip install demucs'). Attempting fallback to original audio.")
 
-def separate_sources(model, mix, segment=10.0, overlap=0.1, device=None, fade_class=None):
+def separate_sources(model, separator, mix, segment=10.0, overlap=0.1, device=None, fade_class=None):
     """
-    Apply model to a given mixture. Use fade, and add segments together to process audio segment by segment.
+    Apply model to a given mixture using the Demucs Separator. Use fade and add segments together to process audio segment by segment.
     
     Args:
         model: The loaded Hybrid Demucs model.
+        separator: The Demucs Separator instance for processing.
         mix: Input audio tensor of shape (batch, channels, length).
-        segment: Segment length in seconds.
+        segment: Segment length in seconds (unused in direct Separator call but kept for compatibility).
         overlap: Overlap ratio between segments.
         device: Device to perform computation on.
-        fade_class: Fade transform class for overlap handling.
+        fade_class: Fade transform class for overlap handling (unused in direct Separator call but kept for compatibility).
     
     Returns:
         Separated sources tensor.
@@ -75,41 +78,38 @@ def separate_sources(model, mix, segment=10.0, overlap=0.1, device=None, fade_cl
         device = torch.device(device)
 
     batch, channels, length = mix.shape
-    sample_rate = 44100  # As per HDEMUCS_HIGH_MUSDB_PLUS sample rate
     
-    chunk_len = int(sample_rate * segment * (1 + overlap))
-    start = 0
-    end = chunk_len
-    overlap_frames = overlap * sample_rate
-    fade = fade_class(fade_in_len=0, fade_out_len=int(overlap_frames), fade_shape="linear")
-
-    final = torch.zeros(batch, len(model.sources), channels, length, device=device)
-
-    while start < length - overlap_frames:
-        chunk = mix[:, :, start:end]
-        with torch.no_grad():
-            out = model.forward(chunk)
-        out = fade(out)
-        final[:, :, :, start:end] += out
-        if start == 0:
-            fade.fade_in_len = int(overlap_frames)
-            start += int(chunk_len - overlap_frames)
+    # Ensure input is in the correct shape for Separator (channels, length)
+    if batch > 1:
+        raise ValueError("Batch dimension should be 1 for Demucs Separator processing.")
+    audio_input = mix.squeeze(0)  # Shape (channels, length)
+    
+    # Use the Separator to process the audio
+    print("Processing audio with Demucs Separator...")
+    with torch.no_grad():
+        origin, res = separator.separate_tensor(audio_input)
+    
+    # Convert result back to expected shape (batch, num_sources, channels, length)
+    num_sources = len(res)
+    final = torch.zeros(batch, num_sources, channels, length, device=device)
+    for idx, (name, source) in enumerate(res.items()):
+        if source.shape == (channels, length):
+            final[0, idx, :, :] = source
         else:
-            start += chunk_len
-        end += chunk_len
-        if end >= length:
-            fade.fade_out_len = 0
+            print(f"Warning: Source {name} shape mismatch {source.shape}, expected {(channels, length)}. Skipping.")
+    
     return final
 
-def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model: Optional[object] = None, device_id: str = "0") -> np.ndarray:
+def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model: Optional[object] = None, device_id: str = "0", model_name: str = "htdemucs_ft") -> np.ndarray:
     """
-    Apply vocal separation to audio using torchaudio's Hybrid Demucs pipeline.
+    Apply vocal separation to audio using a direct implementation of Hybrid Transformer Demucs.
     
     Args:
         audio: Input audio array.
         sampling_rate: Sampling rate of the audio.
         model: Pre-loaded Hybrid Demucs model instance, if available.
         device_id: Device ID from CLI argument to determine the device for processing.
+        model_name: Name of the Demucs model variant to load (default: htdemucs_ft for fine-tuned Hybrid Transformer Demucs).
     
     Returns:
         Processed audio array containing only vocals.
@@ -118,8 +118,9 @@ def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model:
     
     if model is None:
         try:
-            model_info = get_hdemucs_separator(device_id)
+            model_info = get_hdemucs_separator(device_id, model_name=model_name)
             model = model_info["model"]
+            separator = model_info["separator"]
             target_sample_rate = model_info["sample_rate"]
             device = model_info["device"]
             fade_class = model_info["fade"]
@@ -128,11 +129,12 @@ def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model:
             print(f"Original audio stats - Length: {len(original_audio)} samples, Sample rate: {sampling_rate} Hz")
             return original_audio
     else:
-        target_sample_rate = 44100  # Default for HDEMUCS_HIGH_MUSDB_PLUS
-        device = model.device
-        fade_class = torch.transforms.Fade if not hasattr(model, "fade") else model.fade
+        target_sample_rate = 44100  # Default for most Demucs models
+        separator = model.get("separator") if isinstance(model, dict) else None
+        device = model.get("device") if isinstance(model, dict) else model.device
+        fade_class = torch.transforms.Fade if not hasattr(model, "fade") else model.get("fade", torch.transforms.Fade)
     
-    print("Separating vocals from background music using Hybrid Demucs...")
+    print("Separating vocals from background music using Hybrid Transformer Demucs...")
     print(f"Input audio stats - Length: {len(audio)} samples, Shape: {audio.shape}, Sample rate: {sampling_rate} Hz")
     
     if len(audio) == 0:
@@ -184,9 +186,9 @@ def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model:
         print(f"Audio tensor shape for processing: {audio_tensor.shape}")
         
         # Process audio using Hybrid Demucs with chunking to manage memory
-        sources = separate_sources(model, audio_tensor, segment=10.0, overlap=0.1, device=device, fade_class=fade_class)
+        sources = separate_sources(model, separator, audio_tensor, segment=10.0, overlap=0.1, device=device, fade_class=fade_class)
         
-        # Extract vocals (index 2 in model.sources for HDEMUCS_HIGH_MUSDB_PLUS, typically ['drums', 'bass', 'vocals', 'other'])
+        # Extract vocals (index based on model.sources, typically ['drums', 'bass', 'vocals', 'other'])
         sources_list = model.sources if hasattr(model, 'sources') else ['drums', 'bass', 'vocals', 'other']
         vocals_idx = sources_list.index('vocals') if 'vocals' in sources_list else 2
         vocals_tensor = sources[0, vocals_idx]  # Shape (channels, samples)

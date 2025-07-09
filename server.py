@@ -113,6 +113,18 @@ async def transcribe_audio(file: UploadFile = File(...)):
             sys.argv.extend(["--min-speakers", str(args.min_speakers)])
         if hasattr(args, 'max_speakers') and args.max_speakers is not None:
             sys.argv.extend(["--max-speakers", str(args.max_speakers)])
+        if hasattr(args, 'beam_size') and args.beam_size is not None:
+            sys.argv.extend(["--beam-size", str(args.beam_size)])
+        if hasattr(args, 'temperature') and args.temperature is not None:
+            sys.argv.extend(["--temperature", str(args.temperature)])
+        if hasattr(args, 'vocal_removal') and args.vocal_removal is not None:
+            sys.argv.extend(["--vocal-removal", str(args.vocal_removal).lower()])
+        if hasattr(args, 'vocal_method') and args.vocal_method:
+            sys.argv.extend(["--vocal-method", args.vocal_method])
+        if hasattr(args, 'vocal_model') and args.vocal_model:
+            sys.argv.extend(["--vocal-model", args.vocal_model])
+        if hasattr(args, 'vocal_model_dir') and args.vocal_model_dir:
+            sys.argv.extend(["--vocal-model-dir", args.vocal_model_dir])
         
         # Redirect stdout and stderr to capture output and avoid display conflicts
         stdout_capture = io.StringIO()

@@ -154,6 +154,20 @@ parser.add_argument(
     help="Defines the maximum number of speakers that the system should consider in diarization. Must be at least 1. Cannot be used together with --num-speakers. Must be greater than or equal to --min-speakers if both are specified. (default: None)",
 )
 parser.add_argument(
+    "--beam-size",
+    required=False,
+    default=1,
+    type=int,
+    help="Number of beams for beam search in transcription. Higher values may improve accuracy but increase computation time. (default: 1)",
+)
+parser.add_argument(
+    "--temperature",
+    required=False,
+    default=0.0,
+    type=float,
+    help="Temperature for transcription output randomness. Lower values are more deterministic, higher values introduce diversity. (default: 0.0)",
+)
+parser.add_argument(
     "--vocal-removal",
     required=False,
     type=bool,
@@ -275,9 +289,11 @@ def main():
     if args.model_name.split(".")[-1] == "en":
         generate_kwargs.pop("task")
 
-    # Keep generate_kwargs minimal to match original implementation
-    # No additional parameters beyond task and language
-    pass
+    # Update generate_kwargs with beam size and temperature
+    generate_kwargs.update({
+        "num_beams": args.beam_size,
+        "temperature": args.temperature
+    })
 
     with Progress(
         TextColumn("🤗 [progress.description]{task.description}"),
@@ -331,9 +347,15 @@ def main():
                     print("Applying vocal removal using UVR method to isolate speech...")
                     audio = apply_vocal_removal(audio, sr, model_name=args.vocal_model, model_dir=args.vocal_model_dir, device_id=args.device_id)
                 else:  # hdemucs
-                    from insanely_fast_whisper.utils.hdemucs import apply_hdemucs_vocal_separation
-                    print("Applying vocal removal using Hybrid Demucs method to isolate speech...")
-                    audio = apply_hdemucs_vocal_separation(audio, sr, device_id=args.device_id)
+                    try:
+                        from insanely_fast_whisper.utils.hdemucs_direct import apply_hdemucs_vocal_separation
+                        print("Applying vocal removal using direct Hybrid Transformer Demucs method to isolate speech...")
+                        audio = apply_hdemucs_vocal_separation(audio, sr, device_id=args.device_id, model_name="htdemucs_ft")
+                    except ImportError as ie:
+                        print(f"Direct Demucs implementation not available: {str(ie)}. Falling back to torchaudio implementation.")
+                        from insanely_fast_whisper.utils.hdemucs import apply_hdemucs_vocal_separation
+                        print("Applying vocal removal using Hybrid Demucs method to isolate speech...")
+                        audio = apply_hdemucs_vocal_separation(audio, sr, device_id=args.device_id)
                 print("Vocal removal completed.")
                 # Update audio duration after vocal removal for consistency in subsequent steps
                 audio_duration = len(audio) / sr
