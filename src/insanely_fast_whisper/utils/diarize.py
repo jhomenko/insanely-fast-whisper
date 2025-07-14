@@ -143,6 +143,9 @@ def post_process_segments_and_transcripts(new_segments, transcript, group_by_spe
         [chunk["timestamp"][1] if "timestamp" in chunk and len(chunk["timestamp"]) > 1 and chunk["timestamp"][1] is not None else sys.float_info.max for chunk in chunks]
     )
     segmented_preds = []
+    
+    # Keep track of original chunks and timestamps for handling remaining chunks
+    original_chunks = chunks.copy()
 
     # align the diarizer timestamps and the ASR timestamps
     for segment in new_segments:
@@ -173,5 +176,30 @@ def post_process_segments_and_transcripts(new_segments, transcript, group_by_spe
         # crop the transcripts and timestamp lists according to the latest timestamp (for faster argmin)
         chunks = chunks[upto_idx + 1:]
         end_timestamps = end_timestamps[upto_idx + 1:]
+
+    # Handle remaining chunks that weren't assigned to any speaker segment
+    # This fixes the issue where the last chunk gets cut off
+    if len(chunks) > 0 and len(new_segments) > 0:
+        # Assign remaining chunks to the last speaker
+        last_speaker = new_segments[-1]["speaker"]
+        print(f"Found {len(chunks)} remaining chunks after diarization. Assigning to last speaker: {last_speaker}")
+        
+        if group_by_speaker:
+            # If we're grouping by speaker, we need to extend the last segment's text and timestamp
+            if segmented_preds:
+                # Extend the last segment
+                remaining_text = "".join([chunk["text"] for chunk in chunks])
+                segmented_preds[-1]["text"] += remaining_text
+                
+                # Update the end timestamp to include the last chunk
+                if chunks and "timestamp" in chunks[-1] and len(chunks[-1]["timestamp"]) > 1:
+                    segmented_preds[-1]["timestamp"] = (
+                        segmented_preds[-1]["timestamp"][0],
+                        chunks[-1]["timestamp"][1]
+                    )
+        else:
+            # If not grouping by speaker, add each remaining chunk individually
+            for chunk in chunks:
+                segmented_preds.append({"speaker": last_speaker, **chunk})
 
     return segmented_preds

@@ -1,3 +1,8 @@
+import sys
+import os
+# Add the current directory to Python path to use patched transformers
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import json
 import argparse
 import time
@@ -275,6 +280,10 @@ def main():
     if args.model_name.split(".")[-1] == "en":
         generate_kwargs.pop("task")
 
+    # Fix for Transformers v4.47+ cache format change
+    # Add return_legacy_cache=True to maintain backward compatibility
+    generate_kwargs["return_legacy_cache"] = True
+    
     # Keep generate_kwargs minimal to match original implementation
     # No additional parameters beyond task and language
     pass

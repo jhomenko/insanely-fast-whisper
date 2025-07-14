@@ -3,13 +3,9 @@ import torch
 import numpy as np
 from typing import Optional
 
-# Global model cache to avoid reloading
-_hdemucs_model_cache = {}
-
 def get_hdemucs_separator(device_id: str = "0") -> object:
     """
     Load the Hybrid Demucs model for vocal separation using torchaudio's pre-trained pipeline.
-    Uses caching to avoid reloading the model.
     
     Args:
         device_id: Device ID from CLI argument to determine the device for processing.
@@ -17,27 +13,20 @@ def get_hdemucs_separator(device_id: str = "0") -> object:
     Returns:
         Hybrid Demucs model instance for vocal separation.
     """
-    # Device selection
-    if device_id == "xpu" and torch.xpu.is_available():
-        device = "xpu"
-    elif device_id == "mps" and torch.backends.mps.is_available():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = f"cuda:{device_id}" if device_id.isdigit() else "cuda:0"
-    else:
-        device = "cpu"
-    
-    # Check cache first
-    cache_key = f"hdemucs_{device}"
-    if cache_key in _hdemucs_model_cache:
-        print(f"Using cached Hybrid Demucs model on {device}")
-        return _hdemucs_model_cache[cache_key]
-    
     try:
         from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS
         from torchaudio.transforms import Fade
         print("Debug: torchaudio library and HDEMUCS pipeline imported successfully.")
         
+        # Device selection
+        if device_id == "xpu" and torch.xpu.is_available():
+            device = "xpu"
+        elif device_id == "mps" and torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = f"cuda:{device_id}" if device_id.isdigit() else "cuda:0"
+        else:
+            device = "cpu"
         print(f"Loading Hybrid Demucs model on {device}...")
         
         # Load the pre-trained model
@@ -46,13 +35,7 @@ def get_hdemucs_separator(device_id: str = "0") -> object:
         model.to(device)
         print(f"Hybrid Demucs model loaded successfully on {device}. Sample rate: {bundle.sample_rate} Hz")
         
-        model_info = {"model": model, "sample_rate": bundle.sample_rate, "device": device, "fade": Fade}
-        
-        # Cache the model
-        _hdemucs_model_cache[cache_key] = model_info
-        print(f"Cached Hybrid Demucs model for device {device}")
-        
-        return model_info
+        return {"model": model, "sample_rate": bundle.sample_rate, "device": device, "fade": Fade}
     except (ImportError, Exception) as e:
         print(f"Debug: Failed to import torchaudio or load HDEMUCS model: {str(e)}")
         raise ImportError("torchaudio library not detected or incompatible. Ensure 'torchaudio' is installed correctly (e.g., via 'pip install torchaudio'). Attempting fallback to original audio.")
@@ -104,16 +87,14 @@ def separate_sources(model, mix, segment=10.0, overlap=0.1, device=None, fade_cl
             fade.fade_out_len = 0
     return final
 
-def apply_vocal_removal(audio: np.ndarray, sampling_rate: int, model_name: str = "hdemucs_mmi", 
-                       model_dir: str = "./uvr_models", device_id: str = "0") -> np.ndarray:
+def apply_hdemucs_vocal_separation(audio: np.ndarray, sampling_rate: int, model: Optional[object] = None, device_id: str = "0") -> np.ndarray:
     """
     Apply vocal separation to audio using torchaudio's Hybrid Demucs pipeline.
     
     Args:
         audio: Input audio array.
         sampling_rate: Sampling rate of the audio.
-        model_name: Model name (kept for compatibility, not used by HDemucs).
-        model_dir: Model directory (kept for compatibility, not used by HDemucs).
+        model: Pre-loaded Hybrid Demucs model instance, if available.
         device_id: Device ID from CLI argument to determine the device for processing.
     
     Returns:
@@ -121,16 +102,21 @@ def apply_vocal_removal(audio: np.ndarray, sampling_rate: int, model_name: str =
     """
     original_audio = audio.copy()
     
-    try:
-        model_info = get_hdemucs_separator(device_id)
-        model = model_info["model"]
-        target_sample_rate = model_info["sample_rate"]
-        device = model_info["device"]
-        fade_class = model_info["fade"]
-    except Exception as e:
-        print(f"Unable to load Hybrid Demucs model due to: {str(e)}. Proceeding with original audio as fallback.")
-        print(f"Original audio stats - Length: {len(original_audio)} samples, Sample rate: {sampling_rate} Hz")
-        return original_audio
+    if model is None:
+        try:
+            model_info = get_hdemucs_separator(device_id)
+            model = model_info["model"]
+            target_sample_rate = model_info["sample_rate"]
+            device = model_info["device"]
+            fade_class = model_info["fade"]
+        except Exception as e:
+            print(f"Unable to load Hybrid Demucs model due to: {str(e)}. Proceeding with original audio as fallback.")
+            print(f"Original audio stats - Length: {len(original_audio)} samples, Sample rate: {sampling_rate} Hz")
+            return original_audio
+    else:
+        target_sample_rate = 44100  # Default for HDEMUCS_HIGH_MUSDB_PLUS
+        device = model.device
+        fade_class = torch.transforms.Fade if not hasattr(model, "fade") else model.fade
     
     print("Separating vocals from background music using Hybrid Demucs...")
     print(f"Input audio stats - Length: {len(audio)} samples, Shape: {audio.shape}, Sample rate: {sampling_rate} Hz")
@@ -219,13 +205,3 @@ def apply_vocal_removal(audio: np.ndarray, sampling_rate: int, model_name: str =
         print(f"Error processing audio with Hybrid Demucs model: {str(e)}. Proceeding with original audio as fallback.")
         print(f"Original audio stats - Length: {len(original_audio)} samples, Sample rate: {sampling_rate} Hz")
         return original_audio
-
-
-# Keep the old function signature for compatibility
-def get_vocal_separator(model_name: str = "hdemucs_mmi", model_dir: str = "./uvr_models", device_id: str = "0"):
-    """Legacy function for compatibility - now returns HDemucs model info"""
-    print("Warning: get_vocal_separator is deprecated. HDemucs model is loaded automatically in apply_vocal_removal.")
-    try:
-        return get_hdemucs_separator(device_id)
-    except Exception:
-        return None
